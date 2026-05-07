@@ -1373,16 +1373,86 @@ CREATE TABLE {$meta_table} (
 	 * @param int $parent_id Variable product ID.
 	 * @return array{min:mixed,max:mixed,onsale:int}
 	 */
+	/**
+	 * Whether a single `wc_products` row represents a product that is
+	 * currently on sale. Mirrors the semantics of
+	 * {@see WC_Product::is_on_sale()} so the cached `onsale` flag in
+	 * `wc_product_meta_lookup` doesn't disagree with what storefront
+	 * templates display.
+	 *
+	 * Conditions (all must hold):
+	 *   * `sale_price` is set and parses to a non-empty string;
+	 *   * `regular_price` is unset or strictly greater than `sale_price`;
+	 *   * `date_on_sale_from` is unset or in the past;
+	 *   * `date_on_sale_to` is unset or in the future.
+	 *
+	 * Datetime columns are stored in GMT (matching the data store's
+	 * write path), so the comparison is against `time()`.
+	 *
+	 * @param object $row Row stdClass from `wc_products`. Must include
+	 *                    at minimum `regular_price`, `sale_price`,
+	 *                    `date_on_sale_from`, `date_on_sale_to`.
+	 * @return bool
+	 */
+	protected function row_is_on_sale( $row ): bool {
+		$sale = isset( $row->sale_price ) ? (string) $row->sale_price : '';
+		if ( '' === $sale ) {
+			return false;
+		}
+
+		$regular = isset( $row->regular_price ) ? (string) $row->regular_price : '';
+		if ( '' !== $regular && (float) $regular <= (float) $sale ) {
+			return false;
+		}
+
+		$now  = time();
+		$from = isset( $row->date_on_sale_from ) ? (string) $row->date_on_sale_from : '';
+		$to   = isset( $row->date_on_sale_to ) ? (string) $row->date_on_sale_to : '';
+
+		if ( '' !== $from ) {
+			$from_ts = strtotime( $from . ' UTC' );
+			if ( false !== $from_ts && $from_ts > $now ) {
+				return false;
+			}
+		}
+
+		if ( '' !== $to ) {
+			$to_ts = strtotime( $to . ' UTC' );
+			if ( false !== $to_ts && $to_ts < $now ) {
+				return false;
+			}
+		}
+
+		return true;
+	}
+
 	protected function get_variation_price_range( int $parent_id ): array {
 		global $wpdb;
 
+		// The on-sale predicate has to mirror `WC_Product::is_on_sale()`:
+		//   * sale_price set and < regular_price, AND
+		//   * date_on_sale_from is null or already started, AND
+		//   * date_on_sale_to is null or hasn't ended yet.
+		// Using `sale_price = price` alone (the previous logic) only worked
+		// during the active window for a re-saved product, and silently
+		// flagged every product whose `price` row hadn't been refreshed
+		// after the sale-to date passed.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$row = $wpdb->get_row(
 			$wpdb->prepare(
 				'SELECT
 					MIN( CAST( price AS DECIMAL(26,8) ) ) AS min_price,
 					MAX( CAST( price AS DECIMAL(26,8) ) ) AS max_price,
-					SUM( CASE WHEN sale_price IS NOT NULL AND sale_price <> "" AND sale_price = price THEN 1 ELSE 0 END ) AS sale_count
+					SUM(
+						CASE
+							WHEN sale_price IS NOT NULL AND sale_price <> ""
+								AND ( regular_price IS NULL OR regular_price = "" OR CAST(regular_price AS DECIMAL(26,8)) > CAST(sale_price AS DECIMAL(26,8)) )
+								AND ( date_on_sale_from IS NULL OR date_on_sale_from <= UTC_TIMESTAMP() )
+								AND ( date_on_sale_to   IS NULL OR date_on_sale_to   >= UTC_TIMESTAMP() )
+							THEN 1
+							ELSE 0
+						END
+					) AS sale_count
 				FROM ' . self::get_products_table_name() . " WHERE parent_id = %d AND type = %s AND status = %s AND price IS NOT NULL AND price <> ''", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				$parent_id,
 				ProductType::VARIATION,
@@ -2118,7 +2188,7 @@ CREATE TABLE {$meta_table} (
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$row = $wpdb->get_row(
 			$wpdb->prepare(
-				'SELECT id, sku, global_unique_id, virtual, downloadable, price, regular_price, sale_price, stock_quantity, stock_status, rating_count, average_rating, total_sales, tax_status, tax_class, manage_stock, cogs_value FROM %i WHERE id = %d LIMIT 1',
+				'SELECT id, sku, global_unique_id, virtual, downloadable, price, regular_price, sale_price, date_on_sale_from, date_on_sale_to, stock_quantity, stock_status, rating_count, average_rating, total_sales, tax_status, tax_class, manage_stock, cogs_value FROM %i WHERE id = %d LIMIT 1',
 				self::get_products_table_name(),
 				$product_id
 			)
@@ -2130,7 +2200,7 @@ CREATE TABLE {$meta_table} (
 
 		$min_price = $row->price;
 		$max_price = $row->price;
-		$onsale    = ( null !== $row->sale_price && '' !== $row->sale_price && (string) $row->price === (string) $row->sale_price ) ? 1 : 0;
+		$onsale    = $this->row_is_on_sale( $row ) ? 1 : 0;
 
 		// For variable parents, derive min/max from their children's
 		// `wc_products.price` directly. We don't trust whatever value (if any)
