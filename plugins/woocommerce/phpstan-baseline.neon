@@ -10809,7 +10809,7 @@ parameters:
 		-
 			message: '#^Call to static method add_hook\(\) on an unknown class WP_CLI\.$#'
 			identifier: class.notFound
-			count: 10
+			count: 11
 			path: includes/class-wc-cli.php
 
 		-
@@ -74855,3 +74855,80 @@ parameters:
 			identifier: argument.type
 			count: 1
 			path: src/Utilities/StringUtil.php
+		-
+			message: '#^Call to static method add_command\(\) on an unknown class WP_CLI\.$#'
+			identifier: class.notFound
+			count: 5
+			path: src/Database/Migrations/CustomProductsTable/CLIRunner.php
+
+		-
+			message: '#^Call to static method error\(\) on an unknown class WP_CLI\.$#'
+			identifier: class.notFound
+			count: 1
+			path: src/Database/Migrations/CustomProductsTable/CLIRunner.php
+
+		-
+			message: '#^Call to static method halt\(\) on an unknown class WP_CLI\.$#'
+			identifier: class.notFound
+			count: 2
+			path: src/Database/Migrations/CustomProductsTable/CLIRunner.php
+
+		-
+			message: '#^Call to static method log\(\) on an unknown class WP_CLI\.$#'
+			identifier: class.notFound
+			count: 11
+			path: src/Database/Migrations/CustomProductsTable/CLIRunner.php
+
+		-
+			message: '#^Call to static method success\(\) on an unknown class WP_CLI\.$#'
+			identifier: class.notFound
+			count: 5
+			path: src/Database/Migrations/CustomProductsTable/CLIRunner.php
+
+		-
+			message: '#^Call to static method warning\(\) on an unknown class WP_CLI\.$#'
+			identifier: class.notFound
+			count: 4
+			path: src/Database/Migrations/CustomProductsTable/CLIRunner.php
+
+		-
+			message: '#^Function WP_CLI\\Utils\\format_items not found\.$#'
+			identifier: function.notFound
+			count: 1
+			path: src/Database/Migrations/CustomProductsTable/CLIRunner.php
+
+		-
+			message: '#^Function WP_CLI\\Utils\\make_progress_bar not found\.$#'
+			identifier: function.notFound
+			count: 2
+			path: src/Database/Migrations/CustomProductsTable/CLIRunner.php
+
+		-
+			message: '#^Parameter &\$product by\-ref type of method Automattic\\WooCommerce\\Internal\\DataStores\\Products\\ProductsTableDataStore\:\:read_meta_into_product\(\) expects WC_Product, WC_Data given\.$#'
+			identifier: parameterByRef.type
+			count: 1
+			path: src/Internal/DataStores/Products/ProductsTableDataStore.php
+
+		-
+			message: '#^$#'
+			identifier: class.notFound
+			count: 1
+			path: src/Internal/DataStores/Products/ProductsTableDataStoreMeta.php
+
+		-
+			message: '#^Call to method get_id\(\) on an unknown class Automattic\\WooCommerce\\Internal\\DataStores\\WC_Data\.$#'
+			identifier: class.notFound
+			count: 1
+			path: src/Internal/DataStores/Products/ProductsTableDataStoreMeta.php
+
+		-
+			message: '#^Parameter \#1 \$object of method Automattic\\WooCommerce\\Internal\\DataStores\\CustomMetaDataStore\:\:add_meta\(\) expects Automattic\\WooCommerce\\Internal\\DataStores\\WC_Data, WC_Data given\.$#'
+			identifier: argument.type
+			count: 1
+			path: src/Internal/DataStores/Products/ProductsTableDataStoreMeta.php
+
+		-
+			message: '#^Parameter \#2 \$meta of method Automattic\\WooCommerce\\Internal\\DataStores\\CustomMetaDataStore\:\:add_meta\(\) expects Automattic\\WooCommerce\\Internal\\DataStores\\stdClass, stdClass given\.$#'
+			identifier: argument.type
+			count: 1
+			path: src/Internal/DataStores/Products/ProductsTableDataStoreMeta.php
