@@ -407,18 +407,15 @@ class PostToProductTableMigrator {
 				if ( ! is_wp_error( $terms ) ) {
 					foreach ( (array) $terms as $term ) {
 						// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-						$wpdb->insert(
+						ProductsTableDataStore::insert_attribute_value_row(
 							ProductsTableDataStore::get_attribute_values_table_name(),
-							array(
-								'product_id'   => $product_id,
-								'attribute_id' => $attribute_row_id,
-								'scope'        => 'product',
-								'value'        => (string) $term->slug,
-								'term_id'      => (int) $term->term_id,
-								'is_default'   => 0,
-								'position'     => $values_position,
-							),
-							array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+							$product_id,
+							$attribute_row_id,
+							'product',
+							(string) $term->slug,
+							(int) $term->term_id,
+							0,
+							$values_position
 						);
 						++$values_position;
 					}
@@ -426,19 +423,15 @@ class PostToProductTableMigrator {
 			} else {
 				$values = wc_get_text_attributes( (string) ( $config['value'] ?? '' ) );
 				foreach ( $values as $value ) {
-					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-					$wpdb->insert(
+					ProductsTableDataStore::insert_attribute_value_row(
 						ProductsTableDataStore::get_attribute_values_table_name(),
-						array(
-							'product_id'   => $product_id,
-							'attribute_id' => $attribute_row_id,
-							'scope'        => 'product',
-							'value'        => (string) $value,
-							'term_id'      => null,
-							'is_default'   => 0,
-							'position'     => $values_position,
-						),
-						array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+						$product_id,
+						$attribute_row_id,
+						'product',
+						(string) $value,
+						null,
+						0,
+						$values_position
 					);
 					++$values_position;
 				}
@@ -446,19 +439,15 @@ class PostToProductTableMigrator {
 
 			// Default attribute (parent-level "first selection" hint).
 			if ( ! empty( $default_attributes[ $attribute_key ] ) ) {
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->insert(
+				ProductsTableDataStore::insert_attribute_value_row(
 					ProductsTableDataStore::get_attribute_values_table_name(),
-					array(
-						'product_id'   => $product_id,
-						'attribute_id' => $attribute_row_id,
-						'scope'        => 'product',
-						'value'        => (string) $default_attributes[ $attribute_key ],
-						'term_id'      => null,
-						'is_default'   => 1,
-						'position'     => 0,
-					),
-					array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+					$product_id,
+					$attribute_row_id,
+					'product',
+					(string) $default_attributes[ $attribute_key ],
+					null,
+					1,
+					0
 				);
 			}
 
@@ -510,19 +499,15 @@ class PostToProductTableMigrator {
 				}
 			}
 
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->insert(
+			ProductsTableDataStore::insert_attribute_value_row(
 				ProductsTableDataStore::get_attribute_values_table_name(),
-				array(
-					'product_id'   => $variation_id,
-					'attribute_id' => $attribute_id,
-					'scope'        => 'variation',
-					'value'        => (string) $value,
-					'term_id'      => $term_id,
-					'is_default'   => 0,
-					'position'     => $position,
-				),
-				array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+				$variation_id,
+				$attribute_id,
+				'variation',
+				(string) $value,
+				$term_id,
+				0,
+				$position
 			);
 			++$position;
 		}

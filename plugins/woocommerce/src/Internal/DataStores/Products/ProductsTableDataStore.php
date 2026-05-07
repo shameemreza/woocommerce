@@ -1472,36 +1472,30 @@ CREATE TABLE {$meta_table} (
 				);
 				$position = 0;
 				foreach ( (array) $attribute->get_terms() as $term ) {
-					$wpdb->insert(
+					self::insert_attribute_value_row(
 						self::get_attribute_values_table_name(),
-						array(
-							'product_id'   => $product_id,
-							'attribute_id' => $attribute_row_id,
-							'scope'        => 'product',
-							'value'        => (string) $term->slug,
-							'term_id'      => (int) $term->term_id,
-							'is_default'   => 0,
-							'position'     => $position,
-						),
-						array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+						$product_id,
+						$attribute_row_id,
+						'product',
+						(string) $term->slug,
+						(int) $term->term_id,
+						0,
+						$position
 					);
 					++$position;
 				}
 			} else {
 				$position = 0;
 				foreach ( (array) $attribute->get_options() as $option ) {
-					$wpdb->insert(
+					self::insert_attribute_value_row(
 						self::get_attribute_values_table_name(),
-						array(
-							'product_id'   => $product_id,
-							'attribute_id' => $attribute_row_id,
-							'scope'        => 'product',
-							'value'        => (string) $option,
-							'term_id'      => null,
-							'is_default'   => 0,
-							'position'     => $position,
-						),
-						array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+						$product_id,
+						$attribute_row_id,
+						'product',
+						(string) $option,
+						null,
+						0,
+						$position
 					);
 					++$position;
 				}
@@ -1520,18 +1514,15 @@ CREATE TABLE {$meta_table} (
 			if ( $attribute_row_id <= 0 ) {
 				continue;
 			}
-			$wpdb->insert(
+			self::insert_attribute_value_row(
 				self::get_attribute_values_table_name(),
-				array(
-					'product_id'   => $product_id,
-					'attribute_id' => $attribute_row_id,
-					'scope'        => 'product',
-					'value'        => (string) $value,
-					'term_id'      => null,
-					'is_default'   => 1,
-					'position'     => 0,
-				),
-				array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+				$product_id,
+				$attribute_row_id,
+				'product',
+				(string) $value,
+				null,
+				1,
+				0
 			);
 		}
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -1552,6 +1543,54 @@ CREATE TABLE {$meta_table} (
 		 * @param bool       $force_changed Whether the caller forced a recompute.
 		 */
 		do_action( 'woocommerce_product_attributes_updated', $product, false );
+	}
+
+	/**
+	 * Insert one row into `wc_product_attribute_values`, omitting the
+	 * `term_id` column when the value is null.
+	 *
+	 * `wpdb::insert()` casts every supplied value through its declared
+	 * format specifier, so passing `null` against `%d` ends up storing
+	 * `0`. The column is declared `bigint(20) unsigned NULL DEFAULT NULL`
+	 * and downstream code uses `term_id IS NOT NULL` to distinguish
+	 * taxonomy-bound rows from custom-attribute rows; the legacy bug
+	 * silently bound text-attribute rows to term_id 0, breaking
+	 * faceted-filter queries that rely on the predicate.
+	 *
+	 * Centralising the insert here keeps every call site (legacy
+	 * `persist_attributes()`, the listener mirror, the migrator) in
+	 * lockstep on the same NULL-safe contract.
+	 *
+	 * @param string   $values_table Resolved attribute values table.
+	 * @param int      $product_id   Product or variation id.
+	 * @param int      $attribute_id `wc_product_attributes.id` reference.
+	 * @param string   $scope        `'product'` or `'variation'`.
+	 * @param string   $value        Stored slug or raw text value.
+	 * @param int|null $term_id      Term id when known, null otherwise.
+	 * @param int      $is_default   1 for default-attribute markers, 0 otherwise.
+	 * @param int      $position     0-based position within the attribute.
+	 * @return void
+	 */
+	public static function insert_attribute_value_row( string $values_table, int $product_id, int $attribute_id, string $scope, string $value, ?int $term_id, int $is_default, int $position ): void {
+		global $wpdb;
+
+		$data = array(
+			'product_id'   => $product_id,
+			'attribute_id' => $attribute_id,
+			'scope'        => $scope,
+			'value'        => $value,
+			'is_default'   => $is_default,
+			'position'     => $position,
+		);
+		$format = array( '%d', '%d', '%s', '%s', '%d', '%d' );
+
+		if ( null !== $term_id ) {
+			$data['term_id'] = (int) $term_id;
+			$format[]        = '%d';
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->insert( $values_table, $data, $format );
 	}
 
 	/**

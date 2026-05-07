@@ -925,8 +925,6 @@ class ProductDataSyncListener {
 	 * @return void
 	 */
 	private function insert_attribute_values( int $product_id, int $attribute_row_id, array $meta_attribute, string $values_table ): void {
-		global $wpdb;
-
 		$is_taxonomy = ! empty( $meta_attribute['is_taxonomy'] );
 		$name        = (string) ( $meta_attribute['name'] ?? '' );
 
@@ -944,19 +942,15 @@ class ProductDataSyncListener {
 				if ( ! $term || is_wp_error( $term ) ) {
 					continue;
 				}
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->insert(
+				ProductsTableDataStore::insert_attribute_value_row(
 					$values_table,
-					array(
-						'product_id'   => $product_id,
-						'attribute_id' => $attribute_row_id,
-						'scope'        => 'product',
-						'value'        => (string) $term->slug,
-						'term_id'      => (int) $term->term_id,
-						'is_default'   => 0,
-						'position'     => $position,
-					),
-					array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+					$product_id,
+					$attribute_row_id,
+					'product',
+					(string) $term->slug,
+					(int) $term->term_id,
+					0,
+					$position
 				);
 				++$position;
 			}
@@ -966,19 +960,15 @@ class ProductDataSyncListener {
 		$options  = wc_get_text_attributes( (string) ( $meta_attribute['value'] ?? '' ) );
 		$position = 0;
 		foreach ( $options as $option ) {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->insert(
+			ProductsTableDataStore::insert_attribute_value_row(
 				$values_table,
-				array(
-					'product_id'   => $product_id,
-					'attribute_id' => $attribute_row_id,
-					'scope'        => 'product',
-					'value'        => (string) $option,
-					'term_id'      => null,
-					'is_default'   => 0,
-					'position'     => $position,
-				),
-				array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+				$product_id,
+				$attribute_row_id,
+				'product',
+				(string) $option,
+				null,
+				0,
+				$position
 			);
 			++$position;
 		}
@@ -1014,19 +1004,15 @@ class ProductDataSyncListener {
 			if ( $attribute_row_id <= 0 ) {
 				continue;
 			}
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->insert(
+			ProductsTableDataStore::insert_attribute_value_row(
 				$values_table,
-				array(
-					'product_id'   => $product_id,
-					'attribute_id' => $attribute_row_id,
-					'scope'        => 'product',
-					'value'        => (string) $value,
-					'term_id'      => null,
-					'is_default'   => 1,
-					'position'     => 0,
-				),
-				array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+				$product_id,
+				$attribute_row_id,
+				'product',
+				(string) $value,
+				null,
+				1,
+				0
 			);
 		}
 	}

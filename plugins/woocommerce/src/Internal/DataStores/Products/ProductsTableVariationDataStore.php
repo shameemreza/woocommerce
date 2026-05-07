@@ -401,19 +401,15 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 				}
 			}
 
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->insert(
+			self::insert_attribute_value_row(
 				self::get_attribute_values_table_name(),
-				array(
-					'product_id'   => $product_id,
-					'attribute_id' => $attribute_row_id,
-					'scope'        => 'variation',
-					'value'        => $stored_value,
-					'term_id'      => $term_id,
-					'is_default'   => 0,
-					'position'     => $position,
-				),
-				array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+				$product_id,
+				$attribute_row_id,
+				'variation',
+				$stored_value,
+				$term_id,
+				0,
+				$position
 			);
 			++$position;
 		}
