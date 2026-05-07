@@ -146,7 +146,10 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 	/**
 	 * Read a variation back from `wc_products`.
 	 *
-	 * @param WC_Product_Variation $product Variation object passed by reference.
+	 * @param WC_Product $product Variation object passed by reference. Typed
+	 *                            as the parent class so the override is
+	 *                            LSP-compatible with WC_Object_Data_Store_Interface;
+	 *                            callers always pass a WC_Product_Variation.
 	 * @return void
 	 *
 	 * @throws Exception If the variation row cannot be found.
@@ -215,8 +218,8 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 		 *
 		 * @since 10.9.0
 		 *
-		 * @param int                  $product_id The variation ID.
-		 * @param WC_Product_Variation $product    Variation instance.
+		 * @param int        $product_id The variation ID.
+		 * @param WC_Product $product    Variation instance.
 		 */
 		do_action( 'woocommerce_product_read', $product_id, $product );
 	}
@@ -420,7 +423,9 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 		 *
 		 * @since 10.9.0
 		 *
-		 * @param WC_Product $product Variation object.
+		 * @param WC_Product $product       Variation object.
+		 * @param bool       $force_changed Always true here: variations always
+		 *                                  rebuild their attribute rows on save.
 		 */
 		do_action( 'woocommerce_product_attributes_updated', $product, true );
 	}
@@ -486,7 +491,9 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 	 * Generate a variation title using the parent name + attribute summary,
 	 * mirroring `WC_Product_Variation_Data_Store_CPT::generate_product_title()`.
 	 *
-	 * @param WC_Product_Variation $product Variation object.
+	 * @param WC_Product $product Variation object (typed as the base class
+	 *                            because the by-ref parent contract widens
+	 *                            it; runtime is always a variation).
 	 * @return string
 	 */
 	protected function generate_product_title( $product ): string {
@@ -510,9 +517,13 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 		/** This filter is documented in includes/data-stores/class-wc-product-variation-data-store-cpt.php */
 		$separator = apply_filters( 'woocommerce_product_variation_title_attributes_separator', ' - ', $product );
 
-		$parent_id    = (int) $product->get_parent_id();
-		$title_base   = $parent_id > 0 ? (string) $this->get_parent_name( $parent_id ) : '';
-		$title_suffix = $should_include_attributes ? wc_get_formatted_variation( $product, true, false ) : '';
+		$parent_id  = (int) $product->get_parent_id();
+		$title_base = $parent_id > 0 ? (string) $this->get_parent_name( $parent_id ) : '';
+
+		$title_suffix = '';
+		if ( $should_include_attributes && $product instanceof WC_Product_Variation ) {
+			$title_suffix = wc_get_formatted_variation( $product, true, false );
+		}
 
 		/** This filter is documented in includes/data-stores/class-wc-product-variation-data-store-cpt.php */
 		return apply_filters(
@@ -611,11 +622,20 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 	 * `wc_products` row plus the few legacy meta values that drive variation
 	 * fallbacks (e.g. tax_status, sold_individually, cross-sells).
 	 *
-	 * @param WC_Product_Variation $product Variation object.
+	 * @param WC_Product $product Variation object (typed as the base class
+	 *                            so PHPStan is happy with the by-ref parent
+	 *                            contract; runtime is always a variation).
 	 * @return void
 	 */
-	protected function load_parent_data( WC_Product_Variation $product ): void {
+	protected function load_parent_data( WC_Product $product ): void {
 		global $wpdb;
+
+		// set_parent_data() is variation-specific. Bailing here keeps PHPStan
+		// happy and matches reality: only WC_Product_Variation objects ever
+		// reach this code path under HPPS.
+		if ( ! $product instanceof WC_Product_Variation ) {
+			return;
+		}
 
 		$parent_id = (int) $product->get_parent_id();
 		if ( $parent_id <= 0 ) {

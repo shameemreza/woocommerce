@@ -472,11 +472,14 @@ class CLIRunner {
 		}
 
 		$class = WC_Product_Factory::get_classname_from_product_type( $type );
-		if ( ! $class || ! class_exists( $class ) ) {
+		if ( ! is_string( $class ) || ! class_exists( $class ) ) {
 			return null;
 		}
 
 		$product = new $class( 0 );
+		if ( ! $product instanceof WC_Product ) {
+			return null;
+		}
 		$product->set_id( $product_id );
 
 		$store = $this->resolve_legacy_store( $type );
@@ -500,11 +503,14 @@ class CLIRunner {
 		}
 
 		$class = WC_Product_Factory::get_classname_from_product_type( $type );
-		if ( ! $class || ! class_exists( $class ) ) {
+		if ( ! is_string( $class ) || ! class_exists( $class ) ) {
 			return null;
 		}
 
 		$product = new $class( 0 );
+		if ( ! $product instanceof WC_Product ) {
+			return null;
+		}
 		$product->set_id( $product_id );
 
 		$store = $this->hpps_stores[ $type ] ?? $this->hpps_stores['simple'];

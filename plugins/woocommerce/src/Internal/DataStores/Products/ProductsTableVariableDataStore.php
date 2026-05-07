@@ -285,8 +285,10 @@ class ProductsTableVariableDataStore extends ProductsTableDataStore implements W
 			}
 
 			$children = $this->read_children( $product, true );
-			$product->set_children( $children['all'] );
-			$product->set_visible_children( $children['visible'] );
+			if ( $product instanceof \WC_Product_Variable ) {
+				$product->set_children( $children['all'] );
+				$product->set_visible_children( $children['visible'] );
+			}
 		}
 	}
 
@@ -326,6 +328,10 @@ class ProductsTableVariableDataStore extends ProductsTableDataStore implements W
 	 * @return void
 	 */
 	public function sync_stock_status( &$product ) {
+		if ( ! $product instanceof \WC_Product_Variable ) {
+			return;
+		}
+
 		if ( $product->child_is_in_stock() ) {
 			$product->set_stock_status( ProductStockStatus::IN_STOCK );
 		} elseif ( $this->child_has_stock_status( $product, ProductStockStatus::ON_BACKORDER ) ) {
@@ -491,7 +497,10 @@ class ProductsTableVariableDataStore extends ProductsTableDataStore implements W
 			}
 			$values = $grouped[ $attribute['name'] ] ?? array();
 
-			if ( in_array( null, $values, true ) || in_array( '', $values, true ) || empty( $values ) ) {
+			// Empty array → "Any X" variation: pull the parent's full value
+			// list. Same when one of the values is the empty string, which
+			// is how the legacy CPT data store represents the "Any X" case.
+			if ( empty( $values ) || in_array( '', $values, true ) ) {
 				$values = $attribute['is_taxonomy']
 					? wc_get_object_terms( $product_id, $attribute['name'], 'slug' )
 					: wc_get_text_attributes( $attribute['value'] );
@@ -674,6 +683,10 @@ class ProductsTableVariableDataStore extends ProductsTableDataStore implements W
 	 */
 	protected function any_visible_child_matches( WC_Product $product, string $sql_predicate ): bool {
 		global $wpdb;
+
+		if ( ! $product instanceof \WC_Product_Variable ) {
+			return false;
+		}
 
 		$visible_children = $product->get_visible_children();
 		if ( empty( $visible_children ) ) {

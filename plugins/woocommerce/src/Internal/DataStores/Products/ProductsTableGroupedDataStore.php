@@ -121,11 +121,14 @@ class ProductsTableGroupedDataStore extends ProductsTableDataStore implements WC
 	/**
 	 * Persist the `_children` meta for a grouped product to wc_products_meta.
 	 *
-	 * @param WC_Product $product Product object.
+	 * @param WC_Product $product Product object. Runtime is always a
+	 *                            WC_Product_Grouped — only that subclass
+	 *                            accepts the `'edit'` context arg on
+	 *                            get_children().
 	 * @return void
 	 */
 	protected function persist_children( WC_Product $product ): void {
-		if ( ! is_callable( array( $product, 'get_children' ) ) ) {
+		if ( ! $product instanceof \WC_Product_Grouped ) {
 			return;
 		}
 
@@ -160,7 +163,7 @@ class ProductsTableGroupedDataStore extends ProductsTableDataStore implements WC
 	 *
 	 * @param int    $product_id Product ID.
 	 * @param string $table      Lookup table key (unused; for parent signature compatibility).
-	 * @return void
+	 * @return null Always null, matching the parent's contract.
 	 */
 	public function update_lookup_table( $product_id, $table = '' ) {
 		global $wpdb;
@@ -169,7 +172,7 @@ class ProductsTableGroupedDataStore extends ProductsTableDataStore implements WC
 
 		$product_id = (int) $product_id;
 		if ( $product_id <= 0 ) {
-			return;
+			return null;
 		}
 
 		$children = (array) get_post_meta( $product_id, self::CHILDREN_META_KEY, true );
@@ -177,7 +180,7 @@ class ProductsTableGroupedDataStore extends ProductsTableDataStore implements WC
 
 		if ( empty( $children ) ) {
 			parent::update_lookup_table( $product_id );
-			return;
+			return null;
 		}
 
 		$ids_in = implode( ',', array_map( 'absint', $children ) );
@@ -197,7 +200,7 @@ class ProductsTableGroupedDataStore extends ProductsTableDataStore implements WC
 		parent::update_lookup_table( $product_id );
 
 		if ( ! $row || null === $row->min_price ) {
-			return;
+			return null;
 		}
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -211,5 +214,7 @@ class ProductsTableGroupedDataStore extends ProductsTableDataStore implements WC
 			array( '%s', '%s' ),
 			array( '%d' )
 		);
+
+		return null;
 	}
 }

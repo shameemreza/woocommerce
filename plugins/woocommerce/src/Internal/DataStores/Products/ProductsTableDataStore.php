@@ -956,14 +956,15 @@ CREATE TABLE {$meta_table} (
 	 *
 	 * @param WC_Product $product Product object passed by reference.
 	 * @param array      $args    Deletion args. Supports 'force_delete'.
-	 * @return void
+	 * @return bool True when the product was deleted (or routed to the legacy
+	 *              path), false when the product had no ID.
 	 */
 	public function delete( &$product, $args = array() ) {
 		global $wpdb;
 
 		$product_id = (int) $product->get_id();
 		if ( ! $product_id ) {
-			return;
+			return false;
 		}
 
 		// Unmigrated products live in CPT only — delegate so wp_delete_post,
@@ -971,7 +972,7 @@ CREATE TABLE {$meta_table} (
 		// weren't enabled.
 		if ( ! $this->product_exists_in_hpps( $product_id ) ) {
 			$this->get_legacy_data_store()->delete( $product, $args );
-			return;
+			return true;
 		}
 
 		$args = wp_parse_args( $args, array( 'force_delete' => false ) );
@@ -1017,7 +1018,7 @@ CREATE TABLE {$meta_table} (
 			 * @param int $product_id Product ID.
 			 */
 			do_action( 'woocommerce_delete_product', $product_id );
-			return;
+			return true;
 		}
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -1043,6 +1044,7 @@ CREATE TABLE {$meta_table} (
 		 * @param int $product_id Product ID.
 		 */
 		do_action( 'woocommerce_trash_product', $product_id );
+		return true;
 	}
 
 	/**
@@ -1151,7 +1153,7 @@ CREATE TABLE {$meta_table} (
 
 		// Gallery image IDs are stored as a comma-separated string but the
 		// WC_Product setter expects an array of IDs.
-		if ( ! empty( $row->gallery_image_ids ) && is_callable( array( $product, 'set_gallery_image_ids' ) ) ) {
+		if ( ! empty( $row->gallery_image_ids ) ) {
 			$product->set_gallery_image_ids( array_filter( array_map( 'absint', explode( ',', (string) $row->gallery_image_ids ) ) ) );
 		}
 	}
@@ -1419,9 +1421,7 @@ CREATE TABLE {$meta_table} (
 		$wpdb->delete( self::get_attributes_table_name(), array( 'product_id' => $product_id ), array( '%d' ) );
 
 		$attributes         = (array) $product->get_attributes( 'edit' );
-		$default_attributes = is_callable( array( $product, 'get_default_attributes' ) )
-			? (array) $product->get_default_attributes( 'edit' )
-			: array();
+		$default_attributes = (array) $product->get_default_attributes( 'edit' );
 
 		foreach ( $attributes as $attribute ) {
 			if ( ! $attribute instanceof WC_Product_Attribute ) {
@@ -1525,7 +1525,8 @@ CREATE TABLE {$meta_table} (
 		 *
 		 * @since 10.9.0
 		 *
-		 * @param WC_Product $product Product object.
+		 * @param WC_Product $product       Product object.
+		 * @param bool       $force_changed Whether the caller forced a recompute.
 		 */
 		do_action( 'woocommerce_product_attributes_updated', $product, false );
 	}
@@ -1604,7 +1605,7 @@ CREATE TABLE {$meta_table} (
 		}
 		$product->set_attributes( $attributes );
 
-		if ( $defaults_by_name && is_callable( array( $product, 'set_default_attributes' ) ) ) {
+		if ( $defaults_by_name ) {
 			$product->set_default_attributes( $defaults_by_name );
 		}
 	}
@@ -1658,10 +1659,6 @@ CREATE TABLE {$meta_table} (
 
 		$product_id = (int) $product->get_id();
 		if ( $product_id <= 0 ) {
-			return;
-		}
-
-		if ( ! is_callable( array( $product, 'get_downloads' ) ) ) {
 			return;
 		}
 
@@ -1789,7 +1786,7 @@ CREATE TABLE {$meta_table} (
 			wp_set_post_terms( $product_id, (array) $product->get_tag_ids( 'edit' ), 'product_tag', false );
 		}
 
-		if ( ( $force || array_key_exists( 'brand_ids', $changes ) ) && is_callable( array( $product, 'get_brand_ids' ) ) ) {
+		if ( $force || array_key_exists( 'brand_ids', $changes ) ) {
 			wp_set_post_terms( $product_id, (array) $product->get_brand_ids( 'edit' ), 'product_brand', false );
 		}
 
@@ -1815,10 +1812,7 @@ CREATE TABLE {$meta_table} (
 
 		$product->set_category_ids( wc_get_object_terms( $product_id, 'product_cat', 'term_id' ) );
 		$product->set_tag_ids( wc_get_object_terms( $product_id, 'product_tag', 'term_id' ) );
-
-		if ( is_callable( array( $product, 'set_brand_ids' ) ) ) {
-			$product->set_brand_ids( wc_get_object_terms( $product_id, 'product_brand', 'term_id' ) );
-		}
+		$product->set_brand_ids( wc_get_object_terms( $product_id, 'product_brand', 'term_id' ) );
 
 		$shipping_class_terms = wc_get_object_terms( $product_id, 'product_shipping_class', 'term_id' );
 		$product->set_shipping_class_id( ! empty( $shipping_class_terms ) ? (int) $shipping_class_terms[0] : 0 );
@@ -1910,12 +1904,10 @@ CREATE TABLE {$meta_table} (
 			);
 		}
 
-		// WC_Product extends WC_Data which keeps meta in a private property
-		// reached via reflection. Use the public set_meta_data() method when
-		// available; fall back to read_meta_data() for older bases.
-		if ( is_callable( array( $product, 'set_meta_data' ) ) ) {
-			$product->set_meta_data( $meta_data );
-		}
+		// WC_Data exposes set_meta_data() for setting the entire collection
+		// in one shot, which is exactly the shape we have after re-hydrating
+		// from the HPPS meta table.
+		$product->set_meta_data( $meta_data );
 	}
 
 	/*
@@ -1938,7 +1930,8 @@ CREATE TABLE {$meta_table} (
 	 *
 	 * @param int    $product_id Product ID.
 	 * @param string $table      Lookup table key (unused; for parent signature compatibility).
-	 * @return void
+	 * @return null Always null, matching the parent's signature in
+	 *              {@see WC_Data_Store_WP::update_lookup_table()}.
 	 */
 	public function update_lookup_table( $product_id, $table = '' ) {
 		global $wpdb;
@@ -1947,7 +1940,7 @@ CREATE TABLE {$meta_table} (
 
 		$product_id = (int) $product_id;
 		if ( $product_id <= 0 ) {
-			return;
+			return null;
 		}
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -1960,7 +1953,7 @@ CREATE TABLE {$meta_table} (
 		);
 
 		if ( ! $row ) {
-			return;
+			return null;
 		}
 
 		$min_price = $row->price;
@@ -1985,7 +1978,7 @@ CREATE TABLE {$meta_table} (
 			'min_price'      => $min_price,
 			'max_price'      => $max_price,
 			'onsale'         => $onsale,
-			'stock_quantity' => 'yes' === wc_bool_to_string( (int) $row->manage_stock ) ? $row->stock_quantity : null,
+			'stock_quantity' => 'yes' === wc_bool_to_string( (bool) (int) $row->manage_stock ) ? $row->stock_quantity : null,
 			'stock_status'   => (string) $row->stock_status,
 			'rating_count'   => (int) $row->rating_count,
 			'average_rating' => (string) $row->average_rating,
@@ -2021,6 +2014,8 @@ CREATE TABLE {$meta_table} (
 			$wpdb->insert( $wpdb->wc_product_meta_lookup, $lookup_data );
 		}
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		return null;
 	}
 
 	/**
@@ -2314,7 +2309,7 @@ CREATE TABLE {$meta_table} (
 			return null;
 		}
 
-		$delta = wc_stock_amount( $stock_quantity );
+		$delta = wc_stock_amount( null === $stock_quantity ? 0 : (int) $stock_quantity );
 
 		switch ( $operation ) {
 			case 'increase':
@@ -2455,7 +2450,8 @@ CREATE TABLE {$meta_table} (
 	 */
 	public function get_products( $args = array() ) {
 		$query = new \WC_Product_Query( $args );
-		return $query->get_products();
+		$results = $query->get_products();
+		return is_array( $results ) ? $results : array();
 	}
 
 	/**
