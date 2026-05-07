@@ -229,7 +229,17 @@ class ProductsTableVariableDataStoreTests extends HppsTestCase {
 	}
 
 	/**
-	 * @testdox sync_variation_names() updates the variation rows in wc_products when the parent is renamed.
+	 * @testdox H7 — sync_variation_names() regenerates each variation title from the parent + attributes, even when the row's stored name has nothing in common with the old parent name.
+	 *
+	 * Round-1 audit gap: the previous version of this test renamed the
+	 * parent from "Dummy Variable Product" to "Renamed Variable" — names
+	 * with no overlap, so a naive `str_replace($old_name, $new_name, $title)`
+	 * implementation also produced a passing result. This version
+	 * deliberately corrupts one variation's stored row name to a string
+	 * that doesn't contain the old parent name. A naive str_replace would
+	 * leave that row alone (no substring match); the H7 regenerator
+	 * replaces the title from scratch using the canonical
+	 * `generate_product_title()` (parent name + attribute summary).
 	 */
 	public function test_sync_variation_names_updates_children_after_rename(): void {
 		global $wpdb;
@@ -237,17 +247,57 @@ class ProductsTableVariableDataStoreTests extends HppsTestCase {
 		$variable     = WC_Helper_Product::create_variation_product();
 		$old_name     = $variable->get_name();
 		$variation_id = (int) $variable->get_children()[0];
-		$old_title    = $this->variation_row_field( $variation_id, 'name' );
+		$other_id     = (int) $variable->get_children()[1] ?? 0;
 
-		// The titles include the parent's name as the prefix; sanity-check
-		// this assumption so the assertion below is meaningful.
+		$old_title = $this->variation_row_field( $variation_id, 'name' );
+
+		// Sanity-check the helper's assumption: variation titles always
+		// embed the parent name. The corrupting write below relies on
+		// this baseline.
 		$this->assertStringContainsString( $old_name, (string) $old_title );
+
+		// Stomp the stored row name with a string that doesn't contain the
+		// old parent name, so a naive `str_replace($old_name, ...)` impl
+		// produces no change here at all. We also clear the placeholder's
+		// post_title so a defensive read-side repair can't paper over a
+		// regression in the actual rename code path.
+		$products_table = ProductsTableDataStore::get_products_table_name();
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->update(
+			$products_table,
+			array( 'name' => 'Stale Custom Title' ),
+			array( 'id' => $variation_id ),
+			array( '%s' ),
+			array( '%d' )
+		);
+		$wpdb->update(
+			$wpdb->posts,
+			array( 'post_title' => 'Stale Custom Title' ),
+			array( 'ID' => $variation_id ),
+			array( '%s' ),
+			array( '%d' )
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
 		$this->sut->sync_variation_names( $variable, $old_name, 'Renamed Variable' );
 
 		$new_title = $this->variation_row_field( $variation_id, 'name' );
-		$this->assertStringContainsString( 'Renamed Variable', (string) $new_title );
+		$this->assertStringContainsString(
+			'Renamed Variable',
+			(string) $new_title,
+			'H7: a variation whose row name doesn\'t contain the old parent name must still be regenerated to include the new parent name. A naive str_replace() impl would leave "Stale Custom Title" unchanged.'
+		);
+		$this->assertStringNotContainsString( 'Stale Custom Title', (string) $new_title, 'The stored row name should be replaced wholesale, not patched.' );
 		$this->assertStringNotContainsString( $old_name, (string) $new_title );
+
+		// Belt-and-braces: the unmodified second variation should also
+		// pick up the new parent name (verifies we didn't accidentally
+		// short-circuit the loop after the corrupted row).
+		if ( $other_id > 0 ) {
+			$other_title = $this->variation_row_field( $other_id, 'name' );
+			$this->assertStringContainsString( 'Renamed Variable', (string) $other_title );
+			$this->assertStringNotContainsString( $old_name, (string) $other_title );
+		}
 	}
 
 	/**

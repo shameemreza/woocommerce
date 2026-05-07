@@ -374,6 +374,90 @@ class ProductDataSyncListenerTests extends HppsTestCase {
 	}
 
 	/**
+	 * @testdox C4 — postmeta-driven attribute rebuild rebinds variation rows to the new parent attribute_id (no orphans, no zeros).
+	 *
+	 * Round-1 audit gap: `test_postmeta_attributes_replacement_drops_old_rows`
+	 * only covered a simple product, so a regression that left variation
+	 * rows pointing at the deleted parent id (or at 0) would slip through.
+	 * This test creates a real variable + variation fixture, captures the
+	 * parent's pre-rebuild attribute_id and the variation's reference to
+	 * it, forces a postmeta-driven rebuild, and asserts that the new
+	 * parent id is non-zero, differs from the pre-rebuild id, and matches
+	 * the variation's `attribute_id` after the rebuild.
+	 */
+	public function test_attributes_rebuild_remaps_variation_attribute_ids_to_new_parent_row(): void {
+		global $wpdb;
+
+		$variable     = WC_Helper_Product::create_variation_product();
+		$variable_id  = (int) $variable->get_id();
+		$variation_id = (int) $variable->get_children()[0];
+		$this->do_hpps_sync();
+
+		$attributes_table       = ProductsTableDataStore::get_attributes_table_name();
+		$attribute_values_table = ProductsTableDataStore::get_attribute_values_table_name();
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$old_parent_size_id = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM {$attributes_table} WHERE product_id = %d AND name = %s LIMIT 1",
+				$variable_id,
+				'pa_size'
+			)
+		);
+		$old_variation_size_id = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT attribute_id FROM {$attribute_values_table} WHERE product_id = %d AND scope = %s AND value = %s LIMIT 1",
+				$variation_id,
+				'variation',
+				'small'
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+		$this->assertGreaterThan( 0, $old_parent_size_id, 'Parent should have a pa_size attribute row.' );
+		$this->assertGreaterThan( 0, $old_variation_size_id, 'Variation should reference a parent attribute_id.' );
+		$this->assertSame( $old_parent_size_id, $old_variation_size_id, 'Variation must point at the parent attribute row before the rebuild.' );
+
+		// Force a rebuild by re-saving `_product_attributes`. We bump every
+		// position so the listener detects a change and runs the
+		// delete-and-reinsert path — which is exactly the C4 hot zone.
+		$existing = (array) get_post_meta( $variable_id, '_product_attributes', true );
+		$this->assertNotEmpty( $existing );
+		foreach ( $existing as &$entry ) {
+			$entry['position'] = (int) ( $entry['position'] ?? 0 ) + 10;
+		}
+		unset( $entry );
+		update_post_meta( $variable_id, '_product_attributes', $existing );
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$new_parent_size_id = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT id FROM {$attributes_table} WHERE product_id = %d AND name = %s LIMIT 1",
+				$variable_id,
+				'pa_size'
+			)
+		);
+		$new_variation_size_id = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT attribute_id FROM {$attribute_values_table} WHERE product_id = %d AND scope = %s AND value = %s LIMIT 1",
+				$variation_id,
+				'variation',
+				'small'
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+		$this->assertGreaterThan( 0, $new_parent_size_id, 'Parent should still have a pa_size row after the rebuild.' );
+		$this->assertNotSame( $old_parent_size_id, $new_parent_size_id, 'Parent attribute row must be re-created (new id) so the test catches a regression where the rebind path is skipped.' );
+		$this->assertGreaterThan( 0, $new_variation_size_id, 'Variation must keep a non-zero attribute_id (no orphan).' );
+		$this->assertSame(
+			$new_parent_size_id,
+			$new_variation_size_id,
+			'C4: variation attribute_id must be rebound to the new parent row id, not left pointing at the deleted id or reset to 0.'
+		);
+	}
+
+	/**
 	 * @testdox saving a custom attribute through WC_Product::save() writes _product_attributes postmeta with the legacy shape.
 	 */
 	public function test_save_with_custom_attribute_writes_postmeta(): void {
@@ -401,6 +485,66 @@ class ProductDataSyncListenerTests extends HppsTestCase {
 		$this->assertSame( 0, (int) $entry['is_taxonomy'] );
 		$this->assertSame( 1, (int) $entry['is_visible'] );
 		$this->assertSame( 0, (int) $entry['is_variation'] );
+	}
+
+	/**
+	 * @testdox H5 — saving a custom (non-taxonomy) attribute persists every value row with term_id IS NULL, not 0.
+	 *
+	 * Round-1 audit gap: `test_persist_attributes_stores_term_id_for_taxonomy`
+	 * only asserts the taxonomy direction (term_id resolves to a real
+	 * term). The H5 fix specifically protects the *custom* direction —
+	 * `$wpdb->insert()` with `term_id => null` and a `%d` format silently
+	 * coerces NULL into 0, breaking every `term_id IS NOT NULL` predicate
+	 * downstream. We need a regression test that fails if the helper goes
+	 * back to the all-columns INSERT path.
+	 */
+	public function test_persist_attributes_stores_null_term_id_for_custom_attribute(): void {
+		global $wpdb;
+
+		$product_id = $this->create_migrated_simple_product();
+
+		$attribute = new WC_Product_Attribute();
+		$attribute->set_id( 0 );
+		$attribute->set_name( 'Material' );
+		$attribute->set_options( array( 'cotton', 'silk' ) );
+		$attribute->set_position( 0 );
+		$attribute->set_visible( true );
+		$attribute->set_variation( false );
+
+		$product = wc_get_product( $product_id );
+		$product->set_attributes( array( $attribute ) );
+		$product->save();
+
+		$values_table = ProductsTableDataStore::get_attribute_values_table_name();
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT value, term_id FROM {$values_table} WHERE product_id = %d AND scope = 'product' ORDER BY position ASC, id ASC",
+				$product_id
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+		$this->assertCount( 2, $rows, 'Both option values should land in wc_product_attribute_values.' );
+		foreach ( $rows as $row ) {
+			$this->assertNull(
+				$row->term_id,
+				sprintf(
+					'Custom attribute value "%s" must store term_id as NULL, not 0. A 0 here means insert_attribute_value_row() regressed back to the unconditional INSERT and `term_id IS NOT NULL` queries will now misclassify the row as a taxonomy reference.',
+					(string) $row->value
+				)
+			);
+		}
+
+		// Belt-and-braces SQL assertion in case PHP's loose typing makes a
+		// 0-valued term_id look like NULL on the way out of $wpdb.
+		$count_zero = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT COUNT(*) FROM {$values_table} WHERE product_id = %d AND scope = 'product' AND term_id = 0", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$product_id
+			)
+		);
+		$this->assertSame( 0, $count_zero, 'No custom-attribute rows should be stored with term_id = 0.' );
 	}
 
 	/**

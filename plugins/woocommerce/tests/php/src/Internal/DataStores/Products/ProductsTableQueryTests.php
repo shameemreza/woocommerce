@@ -134,6 +134,66 @@ class ProductsTableQueryTests extends HppsTestCase {
 	}
 
 	/**
+	 * @testdox H9 — sku filter escapes SQL LIKE meta-characters so an underscore in a SKU doesn't match other SKUs of the same length.
+	 *
+	 * Round-1 audit gap: the existing exact-SKU test used SKUs with no
+	 * `_` or `%`, so a regression that dropped `$wpdb->esc_like()` would
+	 * still produce a passing result (LIKE without metacharacters is
+	 * exact match anyway). This test seeds two SKUs whose only
+	 * difference is a single character; without `esc_like()` MySQL would
+	 * happily match both via `LIKE 'ABC_123'`, which is the precise H9
+	 * regression we need to catch.
+	 */
+	public function test_filter_by_sku_with_underscore_does_not_match_arbitrary_chars(): void {
+		// SKU with a literal underscore — the MySQL LIKE meta character.
+		$wanted = $this->migrated_simple_product( array( 'sku' => 'HPPS_LIKE_TEST_001' ) );
+		// Same length and prefix, but a different middle character.
+		// Without esc_like(), `LIKE 'HPPS_LIKE_TEST_001'` would happily
+		// match `HPPSXLIKEXTESTX001` because `_` is a single-char wildcard
+		// in MySQL. With the H9 fix it's escaped to `LIKE 'HPPS\_LIKE\_TEST\_001'`
+		// and only the literal SKU survives.
+		$noise  = $this->migrated_simple_product( array( 'sku' => 'HPPSXLIKEXTESTX001' ) );
+
+		$results = wc_get_products(
+			array(
+				'sku'    => 'HPPS_LIKE_TEST_001',
+				'return' => 'ids',
+				'limit'  => -1,
+			)
+		);
+
+		$this->assertContains( $wanted, $results );
+		$this->assertNotContains(
+			$noise,
+			$results,
+			'H9: SKU filter must escape `_` so a SKU with literal underscores does not match every same-length SKU. A regression of `$wpdb->esc_like()` would put the noise SKU in the result set.'
+		);
+	}
+
+	/**
+	 * @testdox H9 — sku filter escapes `%` so a SKU containing a literal percent sign doesn't match every other SKU.
+	 */
+	public function test_filter_by_sku_with_percent_does_not_match_everything(): void {
+		$wanted = $this->migrated_simple_product( array( 'sku' => 'PROMO50%-A' ) );
+		$noise  = $this->migrated_simple_product( array( 'sku' => 'PROMO50OFF-A' ) );
+
+		$results = wc_get_products(
+			array(
+				'sku'    => 'PROMO50%-A',
+				'return' => 'ids',
+				'limit'  => -1,
+			)
+		);
+
+		$this->assertContains( $wanted, $results );
+		$this->assertNotContains(
+			$noise,
+			$results,
+			'H9: SKU filter must escape `%` so a SKU with a literal percent sign does not match arbitrary substrings.'
+		);
+	}
+
+	/**
 	 * @testdox sku = '*' matches every product with a non-empty SKU (and skips ones without).
 	 */
 	public function test_filter_by_sku_wildcard(): void {
