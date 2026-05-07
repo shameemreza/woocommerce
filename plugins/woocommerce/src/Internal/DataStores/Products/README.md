@@ -182,7 +182,7 @@ The HPPS tables are also included in `WC_Install::get_tables()`, so a full WC un
 
 ## Bidirectional sync (opt-in)
 
-`ProductDataSyncListener` mirrors third-party `update_post_meta()` / `add_post_meta()` / `delete_post_meta()` writes on `product` and `product_variation` posts back into the matching columns on `wc_products`. It's a defence against extensions that bypass the WC API and write postmeta directly (a pricing plugin doing `update_post_meta( $product_id, '_price', '9.99' )`, an importer that pokes `_stock`).
+`ProductDataSyncListener` keeps `wp_postmeta` and `wc_products` in agreement in both directions, for the curated set of high-impact meta keys defined in `META_TO_COLUMN_MAP` (price, stock, sku, weight and dimensions, virtual/downloadable flags, tax class/status, manage stock, stock status, low-stock amount, sold individually, ratings).
 
 Enable it with:
 
@@ -196,9 +196,23 @@ or programmatically with the filter:
 add_filter( 'woocommerce_hpps_data_sync_enabled', '__return_true' );
 ```
 
-The listener is registered unconditionally but no-ops when sync is off, when the post isn't a product, when the meta key isn't in its mapping table, or when the product hasn't been migrated into HPPS yet. The mapping covers the common conversion paths (price, stock, sku, dimensions, virtual/downloadable flags, tax, ratings); composite columns (gallery, sale dates) and meta that needs richer parsing (cogs) still go through the data store layer.
+### CPT → HPPS
 
-To bracket an HPPS-internal postmeta write so the listener doesn't echo it back, wrap the write in:
+Hooked on `updated_post_meta`, `added_post_meta`, and `deleted_post_meta` at priority 20. Catches third-party plugins that bypass the WC API and write postmeta directly (a pricing plugin doing `update_post_meta( $product_id, '_price', '9.99' )`, an importer poking `_stock`) and replays the change into the matching `wc_products` column with `$wpdb->update()`.
+
+The listener no-ops when sync is off, the post isn't a product or variation, the meta key isn't mapped, or the product hasn't been migrated into HPPS yet.
+
+### HPPS → CPT
+
+Hooked on `woocommerce_new_product`, `woocommerce_update_product`, `woocommerce_new_product_variation`, and `woocommerce_update_product_variation` at priority 20. After a save through the WC API completes, the listener reads the canonical row out of `wc_products` and writes the mapped values back into postmeta with `update_post_meta()`. This keeps legacy reads (REST endpoints not migrated to HPPS, custom `WP_Query` + `meta_query` calls, third-party plugins that read postmeta directly) seeing fresh values.
+
+The writeback no-ops for products that don't exist in HPPS, so the legacy CPT data-store fallback path doesn't double-write postmeta.
+
+### Reentrancy
+
+Both directions share a depth-counted reentrancy guard via `ProductDataSyncListener::start_internal_write()` / `end_internal_write()`. The HPPS → CPT writeback opens the guard before its `update_post_meta()` loop, so the inverse listener bails on the resulting `updated_post_meta` events instead of echoing them back into `wc_products`. The guard is depth-counted, so an extension hooking `updated_post_meta` and triggering another product save inside our writeback stays safe.
+
+To bracket an HPPS-internal postmeta write from your own code so the listener doesn't echo it back, wrap the write in:
 
 ```php
 ProductDataSyncListener::start_internal_write();
@@ -223,7 +237,6 @@ This is the seam Phase 2 dual-mode cutover hangs off. In Phase 1 the default kee
 
 These are known and tracked. Don't ship them as bugs.
 
-- **Listener covers the high-impact meta keys, not every column.** Composite columns (`gallery_image_ids`, `date_on_sale_*`) and the COGS columns are not yet mirrored from postmeta; they update on the next full save through the WC API.
-- **No HPPS → CPT writeback yet.** When sync is on, postmeta drives `wc_products`, but the data store does not push column writes back into postmeta. Reads through the legacy CPT path still work because the placeholder + lookup-table sync keeps `wp_postmeta` populated for the columns the storefront and admin filter on.
+- **Listener covers the high-impact meta keys, not every column.** Composite columns (`gallery_image_ids`, `date_on_sale_*`) and the COGS columns are not yet mirrored in either direction; they update on the next full save through the WC API.
 - **Taxonomies stay in WP.** `product_cat`, `product_tag`, `product_brand`, `product_shipping_class`, and `product_visibility` continue to live in `wp_term_relationships`. Moving them is out of scope for HPPS.
 - **Reports keep using the existing analytics tables.** HPPS feeds `wc_product_meta_lookup` so admin list filters work, but `wc_order_product_lookup` and the WC Analytics tables are unchanged.

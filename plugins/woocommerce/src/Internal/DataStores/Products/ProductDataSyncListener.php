@@ -243,9 +243,20 @@ class ProductDataSyncListener {
 	 * @return void
 	 */
 	public function register_hooks(): void {
+		// CPT → HPPS direction: catch postmeta writes and mirror them into
+		// the wc_products columns.
 		add_action( 'updated_post_meta', array( $this, 'on_post_meta_updated' ), 20, 4 );
 		add_action( 'added_post_meta', array( $this, 'on_post_meta_added' ), 20, 4 );
 		add_action( 'deleted_post_meta', array( $this, 'on_post_meta_deleted' ), 20, 4 );
+
+		// HPPS → CPT direction: after a save through the WC API completes,
+		// push the fresh column values back into postmeta so legacy reads
+		// (third-party plugins that bypass the WC API, REST endpoints not
+		// migrated to HPPS, custom CPT queries) see the updated values.
+		add_action( 'woocommerce_new_product', array( $this, 'on_product_saved' ), 20, 1 );
+		add_action( 'woocommerce_update_product', array( $this, 'on_product_saved' ), 20, 1 );
+		add_action( 'woocommerce_new_product_variation', array( $this, 'on_product_saved' ), 20, 1 );
+		add_action( 'woocommerce_update_product_variation', array( $this, 'on_product_saved' ), 20, 1 );
 	}
 
 	/**
@@ -295,6 +306,89 @@ class ProductDataSyncListener {
 	public function on_post_meta_deleted( $meta_ids, $object_id, $meta_key, $meta_value ): void {
 		unset( $meta_ids, $meta_value );
 		$this->maybe_sync( (int) $object_id, (string) $meta_key, '' );
+	}
+
+	/**
+	 * `woocommerce_(new|update)_product(_variation)?` handler. After the
+	 * data store finishes writing the wc_products row, read it back and
+	 * push the column values into postmeta so legacy reads stay fresh.
+	 *
+	 * No-op unless data sync is enabled and the product has actually
+	 * landed in HPPS (the legacy fallback path doesn't need writeback;
+	 * the CPT data store already wrote postmeta itself).
+	 *
+	 * @internal
+	 *
+	 * @param int $product_id Product or variation ID.
+	 * @return void
+	 */
+	public function on_product_saved( $product_id ): void {
+		$product_id = (int) $product_id;
+		if ( $product_id <= 0 ) {
+			return;
+		}
+
+		if ( self::$internal_write_depth > 0 ) {
+			return;
+		}
+
+		if ( ! $this->synchronizer->data_sync_is_enabled() ) {
+			return;
+		}
+
+		if ( ! $this->product_exists_in_hpps( $product_id ) ) {
+			return;
+		}
+
+		$this->mirror_columns_to_postmeta( $product_id );
+	}
+
+	/**
+	 * Read the canonical wc_products row and replay every mapped column
+	 * into postmeta in one go.
+	 *
+	 * Bracketed by {@see start_internal_write()} / {@see end_internal_write()}
+	 * so the inverse listener (postmeta → column) doesn't echo our writes
+	 * back into wc_products. The guard is depth-counted, so reentrancy
+	 * from extensions that hook `updated_post_meta` and trigger another
+	 * product save stays safe.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return void
+	 */
+	private function mirror_columns_to_postmeta( int $product_id ): void {
+		global $wpdb;
+
+		$columns_csv = implode(
+			', ',
+			array_map(
+				static fn( array $mapping ): string => '`' . $mapping['column'] . '`',
+				self::META_TO_COLUMN_MAP
+			)
+		);
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				'SELECT ' . $columns_csv . ' FROM ' . ProductsTableDataStore::get_products_table_name() . ' WHERE id = %d LIMIT 1',
+				$product_id
+			)
+		);
+
+		if ( ! $row ) {
+			return;
+		}
+
+		self::start_internal_write();
+		try {
+			foreach ( self::META_TO_COLUMN_MAP as $meta_key => $mapping ) {
+				$column        = $mapping['column'];
+				$postmeta_value = $this->coerce_for_postmeta( $mapping['type'], $row->{$column} ?? null );
+				update_post_meta( $product_id, $meta_key, $postmeta_value );
+			}
+		} finally {
+			self::end_internal_write();
+		}
 	}
 
 	/**
@@ -408,6 +502,50 @@ class ProductDataSyncListener {
 			case 'string':
 			default:
 				return null === $raw_value ? '' : (string) $raw_value;
+		}
+	}
+
+	/**
+	 * Inverse of {@see coerce_for_column()} — convert a `wc_products`
+	 * column value into the shape postmeta expects.
+	 *
+	 * Mirrors the legacy CPT data store's serialization conventions:
+	 * - `bool` columns become `'yes'` / `'no'` strings.
+	 * - `int` and `decimal` columns become stringified numbers, with
+	 *   `null` represented as an empty string (CPT convention for
+	 *   "unset", e.g. an empty `_stock` meta).
+	 * - `date` columns become Unix timestamps (matches how
+	 *   `_sale_price_dates_from`/`_sale_price_dates_to` are stored).
+	 * - `string` columns pass through, with `null` collapsed to `''`.
+	 *
+	 * @param string $type      Type tag from the meta map.
+	 * @param mixed  $row_value Value as stored in `wc_products`.
+	 * @return string Postmeta-shaped value.
+	 */
+	private function coerce_for_postmeta( string $type, $row_value ): string {
+		switch ( $type ) {
+			case 'bool':
+				return ( 1 === (int) $row_value ) ? 'yes' : 'no';
+
+			case 'int':
+				return ( null === $row_value || '' === $row_value ) ? '' : (string) (int) $row_value;
+
+			case 'decimal':
+				if ( null === $row_value || '' === $row_value ) {
+					return '';
+				}
+				return (string) wc_format_decimal( $row_value );
+
+			case 'date':
+				if ( null === $row_value || '' === $row_value ) {
+					return '';
+				}
+				$timestamp = is_numeric( $row_value ) ? (int) $row_value : strtotime( (string) $row_value );
+				return ( false === $timestamp || 0 === $timestamp ) ? '' : (string) $timestamp;
+
+			case 'string':
+			default:
+				return null === $row_value ? '' : (string) $row_value;
 		}
 	}
 
