@@ -818,6 +818,11 @@ class ProductDataSyncListener {
 		$attributes_table = ProductsTableDataStore::get_attributes_table_name();
 		$values_table     = ProductsTableDataStore::get_attribute_values_table_name();
 
+		// Snapshot the parent's existing (name => attribute_id) mapping so
+		// we can remap variation-scope rows after the rebuild — see
+		// {@see ProductsTableDataStore::rebind_variation_attribute_ids()}.
+		$old_attribute_ids_by_name = ProductsTableDataStore::snapshot_attribute_ids_by_name( $product_id );
+
 		self::start_internal_write();
 		try {
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
@@ -843,6 +848,14 @@ class ProductDataSyncListener {
 				throw $e;
 			}
 			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+			// Re-issue any variation-scope row's attribute_id to the new
+			// post-rebuild value, matched by name. Done outside the
+			// transaction (the snapshot+update are independent of the
+			// rebuild's atomicity, and a failure here is recoverable on
+			// next variation save).
+			$new_attribute_ids_by_name = ProductsTableDataStore::snapshot_attribute_ids_by_name( $product_id );
+			ProductsTableDataStore::rebind_variation_attribute_ids( $product_id, $old_attribute_ids_by_name, $new_attribute_ids_by_name );
 		} finally {
 			self::end_internal_write();
 		}

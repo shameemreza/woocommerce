@@ -1416,6 +1416,13 @@ CREATE TABLE {$meta_table} (
 			return;
 		}
 
+		// Snapshot the parent's existing (name => attribute_id) map before
+		// we drop and re-issue these rows. Variation-scope rows in
+		// wc_product_attribute_values reference this attribute_id, and
+		// would silently dangle if we re-inserted with new ids without
+		// remapping. See {@see self::rebind_variation_attribute_ids()}.
+		$old_attribute_ids_by_name = self::snapshot_attribute_ids_by_name( $product_id );
+
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->delete( self::get_attribute_values_table_name(), array( 'product_id' => $product_id ), array( '%d' ) );
 		$wpdb->delete( self::get_attributes_table_name(), array( 'product_id' => $product_id ), array( '%d' ) );
@@ -1520,6 +1527,13 @@ CREATE TABLE {$meta_table} (
 		}
 		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
+		// Re-point any variation-scope rows that referenced the old
+		// attribute_ids at the freshly-inserted ones, matched by name.
+		// Without this, every parent attribute save invalidated every
+		// variation's option mapping until the variation was re-saved.
+		$new_attribute_ids_by_name = self::snapshot_attribute_ids_by_name( $product_id );
+		self::rebind_variation_attribute_ids( $product_id, $old_attribute_ids_by_name, $new_attribute_ids_by_name );
+
 		/**
 		 * Fires after a product's attributes have been persisted to HPPS tables.
 		 *
@@ -1529,6 +1543,108 @@ CREATE TABLE {$meta_table} (
 		 * @param bool       $force_changed Whether the caller forced a recompute.
 		 */
 		do_action( 'woocommerce_product_attributes_updated', $product, false );
+	}
+
+	/**
+	 * Snapshot the (attribute_name => attribute_id) map for a parent's
+	 * `wc_product_attributes` rows. Used to remap variation-scope value
+	 * rows after the parent's attributes are rebuilt.
+	 *
+	 * Both `name` and `taxonomy` are kept under their respective keys: the
+	 * variation persister resolves a variation's selected attribute by
+	 * either `name = ?` OR `taxonomy = ?`, so we mirror the same lookup
+	 * semantics here.
+	 *
+	 * @param int $product_id Parent product id.
+	 * @return array<string, int> name (or taxonomy) => attribute_id.
+	 */
+	protected static function snapshot_attribute_ids_by_name( int $product_id ): array {
+		global $wpdb;
+
+		if ( $product_id <= 0 ) {
+			return array();
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT id, name, taxonomy FROM %i WHERE product_id = %d',
+				self::get_attributes_table_name(),
+				$product_id
+			)
+		);
+
+		$map = array();
+		if ( ! is_array( $rows ) ) {
+			return $map;
+		}
+
+		foreach ( $rows as $row ) {
+			$id = (int) $row->id;
+			if ( $id <= 0 ) {
+				continue;
+			}
+			$name = (string) $row->name;
+			if ( '' !== $name ) {
+				$map[ $name ] = $id;
+			}
+			$taxonomy = (string) $row->taxonomy;
+			if ( '' !== $taxonomy && ! isset( $map[ $taxonomy ] ) ) {
+				$map[ $taxonomy ] = $id;
+			}
+		}
+
+		return $map;
+	}
+
+	/**
+	 * Rebind `wc_product_attribute_values` rows scoped to variations
+	 * that still reference the now-defunct `attribute_id` of a parent
+	 * row that was just deleted-and-reinserted.
+	 *
+	 * Matching is by attribute name. Renamed attributes are intentionally
+	 * left dangling so that their variations behave the same as on the
+	 * legacy CPT store, where renaming requires re-saving the variations.
+	 *
+	 * @param int               $parent_id       Variable parent id.
+	 * @param array<string,int> $old_ids_by_name name => old attribute_id.
+	 * @param array<string,int> $new_ids_by_name name => new attribute_id.
+	 * @return void
+	 */
+	protected static function rebind_variation_attribute_ids( int $parent_id, array $old_ids_by_name, array $new_ids_by_name ): void {
+		global $wpdb;
+
+		if ( $parent_id <= 0 || empty( $old_ids_by_name ) || empty( $new_ids_by_name ) ) {
+			return;
+		}
+
+		$values_table   = self::get_attribute_values_table_name();
+		$products_table = self::get_products_table_name();
+
+		foreach ( $old_ids_by_name as $name => $old_id ) {
+			if ( ! isset( $new_ids_by_name[ $name ] ) ) {
+				continue;
+			}
+			$old_id = (int) $old_id;
+			$new_id = (int) $new_ids_by_name[ $name ];
+			if ( $old_id <= 0 || $new_id <= 0 || $old_id === $new_id ) {
+				continue;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->query(
+				$wpdb->prepare(
+					'UPDATE %i v JOIN %i p ON p.id = v.product_id'
+					. " SET v.attribute_id = %d"
+					. " WHERE v.scope = 'variation' AND v.attribute_id = %d AND p.parent_id = %d",
+					$values_table,
+					$products_table,
+					$new_id,
+					$old_id,
+					$parent_id
+				)
+			);
+		}
 	}
 
 	/**
