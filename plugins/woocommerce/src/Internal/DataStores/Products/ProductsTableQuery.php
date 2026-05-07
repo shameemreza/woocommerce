@@ -485,9 +485,14 @@ class ProductsTableQuery {
 			$value = $this->coerce_value( $config['coerce'], $raw );
 
 			if ( 'sku' === $key ) {
-				// LIKE wildcards on the call site; we don't add our own.
+				// Escape SQL LIKE meta-characters so an `_` in a SKU like
+				// `ABC_123` doesn't accidentally match every other SKU of
+				// the same length. The README documents `*` as the only
+				// supported wildcard (handled above), so any literal `_`
+				// or `%` in the user's SKU is data, not a pattern.
+				global $wpdb;
 				$where_parts[] = "p.{$column} LIKE {$config['format']}";
-				$where_args[]  = $value;
+				$where_args[]  = $wpdb->esc_like( (string) $value );
 				continue;
 			}
 
