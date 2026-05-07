@@ -192,8 +192,7 @@ The HPPS tables are also included in `WC_Install::get_tables()`, so a full WC un
 - Booleans: virtual, downloadable, featured, visibility.
 - Quality signals: average rating, rating count, review count.
 - Cost of Goods Sold: `_cogs_total_value` ↔ `cogs_value`. Gated on the COGS feature being enabled — sites that never turned it on keep `wc_products.cogs_value` at NULL and never get a stray `_cogs_total_value` postmeta entry.
-
-Side-table data (`_product_attributes` ↔ `wc_product_attributes` / `wc_product_attribute_values`, `_default_attributes`) is the remaining gap. Those updates only land on a full save through the WC API today.
+- Attributes: `_product_attributes` ↔ `wc_product_attributes` + `wc_product_attribute_values`, plus `_default_attributes` ↔ the `is_default = 1` rows in the values table. Each direction transactionally rebuilds the side tables (or the postmeta blobs) so a partial write can never land. Taxonomy attributes resolve their term IDs through `wc_get_object_terms()` so multilingual / taxonomy-filter plugins keep working; custom attributes round-trip through `wc_get_text_attributes()` / `wc_implode_text_attributes()` to keep the legacy `|`-delimited shape.
 
 Three ways to enable it:
 
@@ -293,6 +292,6 @@ The HPPS path is also skipped while the migration is still in progress: `wc_prod
 
 These are known and tracked. Don't ship them as bugs.
 
-- **Listener mirrors columns, not side-table data.** Sale dates, gallery image IDs, and COGS columns are now synced in both directions (COGS gated on the feature being enabled). The remaining gap is `_product_attributes` and `_default_attributes`, which live in `wc_product_attributes` / `wc_product_attribute_values` and only update on a full save through the WC API.
+- **Listener parity with the WC API save path.** Sale dates, gallery image IDs, COGS columns (gated on the feature being enabled), and the attribute side tables all sync in both directions. The remaining narrow gap is `WC_Product_Attribute::get_all_extra_data()` — third-party fields tacked onto attribute objects don't round-trip through the postmeta-to-side-tables path. Plugins that rely on extra attribute data still need a full save through the WC API to land.
 - **Taxonomies stay in WP.** `product_cat`, `product_tag`, `product_brand`, `product_shipping_class`, and `product_visibility` continue to live in `wp_term_relationships`. Moving them is out of scope for HPPS.
 - **Reports keep using the existing analytics tables.** HPPS feeds `wc_product_meta_lookup` so admin list filters work, but `wc_order_product_lookup` and the WC Analytics tables are unchanged.

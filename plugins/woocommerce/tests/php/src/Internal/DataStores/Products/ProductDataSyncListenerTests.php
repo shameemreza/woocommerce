@@ -12,6 +12,7 @@ use Automattic\WooCommerce\Internal\DataStores\Products\ProductsTableDataStore;
 use Automattic\WooCommerce\RestApi\UnitTests\HPPSToggleTrait;
 use HppsTestCase;
 use WC_Helper_Product;
+use WC_Product_Attribute;
 
 /**
  * Tests for {@see ProductDataSyncListener}: the bidirectional bridge
@@ -243,6 +244,248 @@ class ProductDataSyncListenerTests extends HppsTestCase {
 
 	/*
 	|--------------------------------------------------------------------------
+	| Attributes: side-table sync.
+	|--------------------------------------------------------------------------
+	|
+	| Two cooperating directions:
+	|   - update_post_meta on _product_attributes / _default_attributes
+	|     projects into wc_product_attributes / wc_product_attribute_values.
+	|   - WC_Product::save() with attribute changes regenerates both
+	|     postmeta blobs from the side tables.
+	*/
+
+	/**
+	 * @testdox _product_attributes postmeta with a custom attribute populates the side tables.
+	 */
+	public function test_postmeta_attributes_custom_mirror_to_side_tables(): void {
+		$product_id = $this->create_migrated_simple_product();
+
+		update_post_meta(
+			$product_id,
+			'_product_attributes',
+			array(
+				'material' => array(
+					'name'         => 'Material',
+					'value'        => 'cotton | silk | wool',
+					'position'     => 0,
+					'is_visible'   => 1,
+					'is_variation' => 0,
+					'is_taxonomy'  => 0,
+				),
+			)
+		);
+
+		$attribute_rows = $this->read_attribute_rows( $product_id );
+		$this->assertCount( 1, $attribute_rows, 'One row in wc_product_attributes per declared attribute.' );
+		$this->assertSame( 'Material', $attribute_rows[0]['name'] );
+		$this->assertSame( '', $attribute_rows[0]['taxonomy'], 'Custom attribute must store an empty taxonomy.' );
+		$this->assertSame( 1, (int) $attribute_rows[0]['is_visible'] );
+
+		$value_rows = $this->read_attribute_value_rows( $product_id, (int) $attribute_rows[0]['id'] );
+		$values     = array_map( static fn( array $row ): string => $row['value'], $value_rows );
+		$this->assertSame( array( 'cotton', 'silk', 'wool' ), $values, 'wc_get_text_attributes() must split the | delimited value list verbatim.' );
+		foreach ( $value_rows as $row ) {
+			$this->assertSame( 0, (int) $row['is_default'] );
+		}
+	}
+
+	/**
+	 * @testdox _default_attributes postmeta lands as is_default=1 rows in the values table.
+	 */
+	public function test_postmeta_default_attributes_mirror_to_is_default_rows(): void {
+		$product_id = $this->create_migrated_simple_product();
+
+		update_post_meta(
+			$product_id,
+			'_product_attributes',
+			array(
+				'material' => array(
+					'name'         => 'Material',
+					'value'        => 'cotton | silk',
+					'position'     => 0,
+					'is_visible'   => 1,
+					'is_variation' => 1,
+					'is_taxonomy'  => 0,
+				),
+			)
+		);
+
+		update_post_meta(
+			$product_id,
+			'_default_attributes',
+			array( 'material' => 'silk' )
+		);
+
+		$attribute_rows = $this->read_attribute_rows( $product_id );
+		$this->assertCount( 1, $attribute_rows );
+
+		$value_rows = $this->read_attribute_value_rows( $product_id, (int) $attribute_rows[0]['id'] );
+		$defaults   = array_filter( $value_rows, static fn( array $row ): bool => 1 === (int) $row['is_default'] );
+		$this->assertCount( 1, $defaults, 'Exactly one is_default row for material=silk.' );
+		$default = array_values( $defaults )[0];
+		$this->assertSame( 'silk', $default['value'] );
+	}
+
+	/**
+	 * @testdox swapping the postmeta to a different shape rebuilds the side tables (no orphans).
+	 */
+	public function test_postmeta_attributes_replacement_drops_old_rows(): void {
+		$product_id = $this->create_migrated_simple_product();
+
+		update_post_meta(
+			$product_id,
+			'_product_attributes',
+			array(
+				'material' => array(
+					'name'         => 'Material',
+					'value'        => 'cotton',
+					'position'     => 0,
+					'is_visible'   => 1,
+					'is_variation' => 0,
+					'is_taxonomy'  => 0,
+				),
+			)
+		);
+		$first_rows = $this->read_attribute_rows( $product_id );
+		$this->assertCount( 1, $first_rows );
+
+		update_post_meta(
+			$product_id,
+			'_product_attributes',
+			array(
+				'fabric' => array(
+					'name'         => 'Fabric',
+					'value'        => 'denim | linen',
+					'position'     => 0,
+					'is_visible'   => 1,
+					'is_variation' => 0,
+					'is_taxonomy'  => 0,
+				),
+			)
+		);
+
+		$second_rows = $this->read_attribute_rows( $product_id );
+		$this->assertCount( 1, $second_rows, 'Old "Material" row must be deleted, only "Fabric" remains.' );
+		$this->assertSame( 'Fabric', $second_rows[0]['name'] );
+
+		$value_rows = $this->read_attribute_value_rows( $product_id, (int) $second_rows[0]['id'] );
+		$values     = array_map( static fn( array $row ): string => $row['value'], $value_rows );
+		$this->assertSame( array( 'denim', 'linen' ), $values );
+	}
+
+	/**
+	 * @testdox saving a custom attribute through WC_Product::save() writes _product_attributes postmeta with the legacy shape.
+	 */
+	public function test_save_with_custom_attribute_writes_postmeta(): void {
+		$product_id = $this->create_migrated_simple_product();
+
+		$attribute = new WC_Product_Attribute();
+		$attribute->set_id( 0 );
+		$attribute->set_name( 'Material' );
+		$attribute->set_options( array( 'cotton', 'silk' ) );
+		$attribute->set_position( 0 );
+		$attribute->set_visible( true );
+		$attribute->set_variation( false );
+
+		$product = wc_get_product( $product_id );
+		$product->set_attributes( array( $attribute ) );
+		$product->save();
+
+		$postmeta = get_post_meta( $product_id, '_product_attributes', true );
+		$this->assertIsArray( $postmeta );
+		$this->assertArrayHasKey( 'material', $postmeta, 'sanitize_title( "Material" ) keys the entry.' );
+
+		$entry = $postmeta['material'];
+		$this->assertSame( 'Material', $entry['name'] );
+		$this->assertSame( 'cotton | silk', $entry['value'], 'Custom attribute values must use the WC_DELIMITER form (with surrounding spaces).' );
+		$this->assertSame( 0, (int) $entry['is_taxonomy'] );
+		$this->assertSame( 1, (int) $entry['is_visible'] );
+		$this->assertSame( 0, (int) $entry['is_variation'] );
+	}
+
+	/**
+	 * @testdox saving a taxonomy attribute writes is_taxonomy=1 with an empty value field.
+	 */
+	public function test_save_with_taxonomy_attribute_writes_postmeta(): void {
+		$product_id = $this->create_migrated_simple_product();
+
+		// Sets up a `pa_*` taxonomy + terms and returns a configured attribute.
+		$attribute = WC_Helper_Product::create_product_attribute_object( 'hpps_listener_color', array( 'red', 'blue' ) );
+		$attribute->set_visible( true );
+		$attribute->set_variation( false );
+
+		$product = wc_get_product( $product_id );
+		$product->set_attributes( array( $attribute ) );
+		$product->save();
+
+		$postmeta = get_post_meta( $product_id, '_product_attributes', true );
+		$this->assertIsArray( $postmeta );
+
+		$tax_name = $attribute->get_name();
+		$this->assertArrayHasKey( $tax_name, $postmeta, 'Taxonomy attributes key on the taxonomy slug, not sanitize_title().' );
+
+		$entry = $postmeta[ $tax_name ];
+		$this->assertSame( 1, (int) $entry['is_taxonomy'] );
+		$this->assertSame( '', $entry['value'], 'Taxonomy attributes leave value empty; the option list lives in wp_term_relationships.' );
+	}
+
+	/**
+	 * @testdox saving default attributes writes _default_attributes postmeta from the is_default rows.
+	 */
+	public function test_save_with_default_attributes_writes_postmeta(): void {
+		$product_id = $this->create_migrated_simple_product();
+
+		$attribute = new WC_Product_Attribute();
+		$attribute->set_id( 0 );
+		$attribute->set_name( 'Size' );
+		$attribute->set_options( array( 'S', 'M', 'L' ) );
+		$attribute->set_position( 0 );
+		$attribute->set_visible( true );
+		$attribute->set_variation( true );
+
+		$product = wc_get_product( $product_id );
+		$product->set_attributes( array( $attribute ) );
+		$product->set_default_attributes( array( 'size' => 'M' ) );
+		$product->save();
+
+		$defaults = get_post_meta( $product_id, '_default_attributes', true );
+		$this->assertIsArray( $defaults );
+		$this->assertSame( array( 'size' => 'M' ), $defaults );
+	}
+
+	/**
+	 * @testdox an HPPS save with attribute changes does not recurse through the postmeta listener.
+	 */
+	public function test_attribute_writeback_does_not_recurse(): void {
+		$product_id = $this->create_migrated_simple_product();
+
+		$call_count = 0;
+		$counter    = function () use ( &$call_count ): void {
+			++$call_count;
+		};
+		add_action( 'updated_post_meta', $counter, 100 );
+
+		$attribute = new WC_Product_Attribute();
+		$attribute->set_id( 0 );
+		$attribute->set_name( 'Recurse' );
+		$attribute->set_options( array( 'a', 'b' ) );
+		$attribute->set_visible( true );
+
+		$product = wc_get_product( $product_id );
+		$product->set_attributes( array( $attribute ) );
+		$product->save();
+
+		remove_action( 'updated_post_meta', $counter, 100 );
+
+		// Bound looser than the price-only writeback test because attribute
+		// saves touch more meta keys; the regression to guard against is
+		// runaway recursion (thousands of calls), not a tight upper bound.
+		$this->assertLessThan( 500, $call_count, 'updated_post_meta should not have fired in a runaway loop — attribute reentrancy guard probably regressed.' );
+		$this->assertNotEmpty( get_post_meta( $product_id, '_product_attributes', true ) );
+	}
+
+	/*
+	|--------------------------------------------------------------------------
 	| Gating: option, filter, migration state.
 	|--------------------------------------------------------------------------
 	*/
@@ -461,5 +704,47 @@ class ProductDataSyncListenerTests extends HppsTestCase {
 		);
 
 		return null === $value ? null : (string) $value;
+	}
+
+	/**
+	 * Read every wc_product_attributes row for a product, ordered by
+	 * position, as plain associative arrays.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return array<int, array<string, scalar|null>>
+	 */
+	private function read_attribute_rows( int $product_id ): array {
+		global $wpdb;
+		$table = ProductsTableDataStore::get_attributes_table_name();
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		return $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, name, taxonomy, position, is_visible, is_for_variation FROM {$table} WHERE product_id = %d ORDER BY position ASC, id ASC",
+				$product_id
+			),
+			ARRAY_A
+		) ?: array();
+	}
+
+	/**
+	 * Read wc_product_attribute_values rows for a given attribute row,
+	 * ordered by position.
+	 *
+	 * @param int $product_id   Product ID.
+	 * @param int $attribute_id `wc_product_attributes.id`.
+	 * @return array<int, array<string, scalar|null>>
+	 */
+	private function read_attribute_value_rows( int $product_id, int $attribute_id ): array {
+		global $wpdb;
+		$table = ProductsTableDataStore::get_attribute_values_table_name();
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		return $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT value, term_id, is_default, position FROM {$table} WHERE product_id = %d AND attribute_id = %d AND scope = 'product' ORDER BY position ASC, id ASC",
+				$product_id,
+				$attribute_id
+			),
+			ARRAY_A
+		) ?: array();
 	}
 }

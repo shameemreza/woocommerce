@@ -10,6 +10,8 @@ declare( strict_types = 1 );
 namespace Automattic\WooCommerce\Internal\DataStores\Products;
 
 use Automattic\WooCommerce\Internal\CostOfGoodsSold\CostOfGoodsSoldController;
+use Throwable;
+use WC_Product;
 
 defined( 'ABSPATH' ) || exit;
 
@@ -44,14 +46,27 @@ defined( 'ABSPATH' ) || exit;
 class ProductDataSyncListener {
 
 	/**
+	 * Postmeta keys whose payload is composite — they don't map to a
+	 * single `wc_products` column but to rows in `wc_product_attributes`
+	 * and `wc_product_attribute_values`. Bypass {@see maybe_sync()} and
+	 * route to {@see maybe_sync_attributes()} instead.
+	 *
+	 * @var string[]
+	 */
+	private const COMPOSITE_ATTRIBUTE_META_KEYS = array(
+		'_product_attributes',
+		'_default_attributes',
+	);
+
+	/**
 	 * Map of WordPress meta keys to the column name in `wc_products` they
 	 * mirror. Keys are deliberately conservative: only the meta paths that
 	 * have a 1:1 column counterpart and where third-party plugins are most
 	 * likely to write directly. Side-table data (`_product_attributes` →
 	 * `wc_product_attributes` / `wc_product_attribute_values`,
-	 * `_default_attributes`) is not synced here yet — that lift is tracked
-	 * separately because it needs to drop and rebuild rows in two tables,
-	 * not just write a single column.
+	 * `_default_attributes`) is handled separately via the dedicated
+	 * attribute mirror methods because each write touches two tables and
+	 * needs the legacy postmeta shape decoded into structured rows.
 	 *
 	 * Each entry declares:
 	 *   - `column`: target column in `wc_products`.
@@ -262,7 +277,8 @@ class ProductDataSyncListener {
 	 */
 	public function register_hooks(): void {
 		// CPT → HPPS direction: catch postmeta writes and mirror them into
-		// the wc_products columns.
+		// the wc_products columns (and, for `_product_attributes` /
+		// `_default_attributes`, into the attribute side tables).
 		add_action( 'updated_post_meta', array( $this, 'on_post_meta_updated' ), 20, 4 );
 		add_action( 'added_post_meta', array( $this, 'on_post_meta_added' ), 20, 4 );
 		add_action( 'deleted_post_meta', array( $this, 'on_post_meta_deleted' ), 20, 4 );
@@ -275,6 +291,12 @@ class ProductDataSyncListener {
 		add_action( 'woocommerce_update_product', array( $this, 'on_product_saved' ), 20, 1 );
 		add_action( 'woocommerce_new_product_variation', array( $this, 'on_product_saved' ), 20, 1 );
 		add_action( 'woocommerce_update_product_variation', array( $this, 'on_product_saved' ), 20, 1 );
+
+		// HPPS → CPT direction for attributes specifically. The HPPS data
+		// store fires this after persist_attributes() has rewritten the
+		// side tables, which is exactly the moment the postmeta blobs
+		// need to be regenerated.
+		add_action( 'woocommerce_product_attributes_updated', array( $this, 'on_attributes_updated' ), 20, 2 );
 	}
 
 	/**
@@ -290,6 +312,12 @@ class ProductDataSyncListener {
 	 */
 	public function on_post_meta_updated( $meta_id, $object_id, $meta_key, $meta_value ): void {
 		unset( $meta_id );
+
+		if ( in_array( (string) $meta_key, self::COMPOSITE_ATTRIBUTE_META_KEYS, true ) ) {
+			$this->maybe_sync_attributes( (int) $object_id );
+			return;
+		}
+
 		$this->maybe_sync( (int) $object_id, (string) $meta_key, $meta_value );
 	}
 
@@ -306,6 +334,12 @@ class ProductDataSyncListener {
 	 */
 	public function on_post_meta_added( $meta_id, $object_id, $meta_key, $meta_value ): void {
 		unset( $meta_id );
+
+		if ( in_array( (string) $meta_key, self::COMPOSITE_ATTRIBUTE_META_KEYS, true ) ) {
+			$this->maybe_sync_attributes( (int) $object_id );
+			return;
+		}
+
 		$this->maybe_sync( (int) $object_id, (string) $meta_key, $meta_value );
 	}
 
@@ -323,6 +357,12 @@ class ProductDataSyncListener {
 	 */
 	public function on_post_meta_deleted( $meta_ids, $object_id, $meta_key, $meta_value ): void {
 		unset( $meta_ids, $meta_value );
+
+		if ( in_array( (string) $meta_key, self::COMPOSITE_ATTRIBUTE_META_KEYS, true ) ) {
+			$this->maybe_sync_attributes( (int) $object_id );
+			return;
+		}
+
 		$this->maybe_sync( (int) $object_id, (string) $meta_key, '' );
 	}
 
@@ -359,6 +399,50 @@ class ProductDataSyncListener {
 		}
 
 		$this->mirror_columns_to_postmeta( $product_id );
+	}
+
+	/**
+	 * `woocommerce_product_attributes_updated` handler. The HPPS data
+	 * store fires this after `persist_attributes()` has rewritten the
+	 * side tables, which is when the legacy postmeta blobs
+	 * (`_product_attributes`, `_default_attributes`) need to be
+	 * regenerated.
+	 *
+	 * Bails for products that don't exist in HPPS (saves through the
+	 * legacy CPT data store fallback path don't need a writeback —
+	 * the CPT store wrote the postmeta itself).
+	 *
+	 * @internal
+	 *
+	 * @param mixed $product Product object passed by the action.
+	 * @param mixed $force   Whether the caller forced the update (unused).
+	 * @return void
+	 */
+	public function on_attributes_updated( $product, $force = false ): void {
+		unset( $force );
+
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+
+		$product_id = (int) $product->get_id();
+		if ( $product_id <= 0 ) {
+			return;
+		}
+
+		if ( self::$internal_write_depth > 0 ) {
+			return;
+		}
+
+		if ( ! $this->synchronizer->data_sync_is_enabled() ) {
+			return;
+		}
+
+		if ( ! $this->product_exists_in_hpps( $product_id ) ) {
+			return;
+		}
+
+		$this->mirror_attributes_to_postmeta( $product_id );
 	}
 
 	/**
@@ -655,6 +739,394 @@ class ProductDataSyncListener {
 
 		$timestamp = strtotime( (string) $raw_value );
 		return false === $timestamp ? null : gmdate( 'Y-m-d H:i:s', $timestamp );
+	}
+
+	/**
+	 * Decide whether to sync attributes for a postmeta event on
+	 * `_product_attributes` or `_default_attributes`. Mirrors the
+	 * gating in {@see maybe_sync()} but routes to the side-table
+	 * projection rather than a single-column write.
+	 *
+	 * @param int $object_id Post ID.
+	 * @return void
+	 */
+	private function maybe_sync_attributes( int $object_id ): void {
+		if ( self::$internal_write_depth > 0 ) {
+			return;
+		}
+
+		if ( $object_id <= 0 ) {
+			return;
+		}
+
+		if ( ! $this->synchronizer->data_sync_is_enabled() ) {
+			return;
+		}
+
+		$post_type = get_post_type( $object_id );
+		if ( 'product' !== $post_type && 'product_variation' !== $post_type && 'product_placeholder' !== $post_type ) {
+			return;
+		}
+
+		if ( ! $this->product_exists_in_hpps( $object_id ) ) {
+			return;
+		}
+
+		$this->mirror_attributes_to_hpps( $object_id );
+	}
+
+	/**
+	 * Atomically rebuild `wc_product_attributes` and
+	 * `wc_product_attribute_values` from the postmeta blobs
+	 * `_product_attributes` and `_default_attributes`.
+	 *
+	 * Strategy mirrors {@see ProductsTableDataStore::persist_attributes()}:
+	 * delete every existing row for the product and insert fresh ones,
+	 * inside a transaction so a partial write can never land. The
+	 * legacy postmeta shape decoding follows
+	 * {@see WC_Product_Data_Store_CPT::read_attributes()} so an importer
+	 * or pricing plugin that writes `_product_attributes` directly gets
+	 * the same result HPPS would have produced via a full WC API save.
+	 *
+	 * Wrapped in {@see start_internal_write()} / {@see end_internal_write()}
+	 * to keep the inverse listener
+	 * ({@see on_attributes_updated()}, plus any `wp_set_object_terms()`
+	 * cascades) from echoing back through this same code path.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return void
+	 */
+	private function mirror_attributes_to_hpps( int $product_id ): void {
+		global $wpdb;
+
+		$meta_attributes = get_post_meta( $product_id, '_product_attributes', true );
+		if ( ! is_array( $meta_attributes ) ) {
+			$meta_attributes = array();
+		}
+
+		$default_attributes = get_post_meta( $product_id, '_default_attributes', true );
+		if ( ! is_array( $default_attributes ) ) {
+			$default_attributes = array();
+		}
+
+		$attributes_table = ProductsTableDataStore::get_attributes_table_name();
+		$values_table     = ProductsTableDataStore::get_attribute_values_table_name();
+
+		self::start_internal_write();
+		try {
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->query( 'START TRANSACTION' );
+
+			try {
+				$wpdb->delete( $values_table, array( 'product_id' => $product_id ), array( '%d' ) );
+				$wpdb->delete( $attributes_table, array( 'product_id' => $product_id ), array( '%d' ) );
+
+				foreach ( $meta_attributes as $meta_attribute ) {
+					$attribute_row_id = $this->insert_attribute_row( $product_id, (array) $meta_attribute, $attributes_table );
+					if ( null === $attribute_row_id ) {
+						continue;
+					}
+					$this->insert_attribute_values( $product_id, $attribute_row_id, (array) $meta_attribute, $values_table );
+				}
+
+				$this->insert_default_attributes( $product_id, $default_attributes, $attributes_table, $values_table );
+
+				$wpdb->query( 'COMMIT' );
+			} catch ( Throwable $e ) {
+				$wpdb->query( 'ROLLBACK' );
+				throw $e;
+			}
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		} finally {
+			self::end_internal_write();
+		}
+	}
+
+	/**
+	 * Insert one row into `wc_product_attributes` from a decoded
+	 * postmeta entry. Returns the new row id, or null if the entry
+	 * is malformed and should be skipped.
+	 *
+	 * @param int                  $product_id       Product ID.
+	 * @param array<string, mixed> $meta_attribute   Decoded postmeta entry.
+	 * @param string               $attributes_table Resolved table name.
+	 * @return int|null Row id, or null when the entry is unusable.
+	 */
+	private function insert_attribute_row( int $product_id, array $meta_attribute, string $attributes_table ): ?int {
+		global $wpdb;
+
+		$meta = array_merge(
+			array(
+				'name'         => '',
+				'value'        => '',
+				'position'     => 0,
+				'is_visible'   => 0,
+				'is_variation' => 0,
+				'is_taxonomy'  => 0,
+			),
+			$meta_attribute
+		);
+
+		$name = (string) $meta['name'];
+		if ( '' === $name ) {
+			return null;
+		}
+
+		$is_taxonomy = ! empty( $meta['is_taxonomy'] );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->insert(
+			$attributes_table,
+			array(
+				'product_id'       => $product_id,
+				'name'             => $name,
+				'taxonomy'         => $is_taxonomy ? $name : '',
+				'position'         => (int) $meta['position'],
+				'is_visible'       => empty( $meta['is_visible'] ) ? 0 : 1,
+				'is_for_variation' => empty( $meta['is_variation'] ) ? 0 : 1,
+			),
+			array( '%d', '%s', '%s', '%d', '%d', '%d' )
+		);
+
+		$row_id = (int) $wpdb->insert_id;
+		return $row_id > 0 ? $row_id : null;
+	}
+
+	/**
+	 * Insert the value rows for a single attribute. Taxonomy attributes
+	 * get one row per assigned term (resolved through
+	 * `wc_get_object_terms()` so the result agrees with what the legacy
+	 * data store would have read). Custom attributes get one row per
+	 * `|`-delimited option, decoded via {@see wc_get_text_attributes()}.
+	 *
+	 * @param int                  $product_id       Product ID.
+	 * @param int                  $attribute_row_id `wc_product_attributes.id` of the parent row.
+	 * @param array<string, mixed> $meta_attribute   Decoded postmeta entry.
+	 * @param string               $values_table     Resolved table name.
+	 * @return void
+	 */
+	private function insert_attribute_values( int $product_id, int $attribute_row_id, array $meta_attribute, string $values_table ): void {
+		global $wpdb;
+
+		$is_taxonomy = ! empty( $meta_attribute['is_taxonomy'] );
+		$name        = (string) ( $meta_attribute['name'] ?? '' );
+
+		if ( $is_taxonomy ) {
+			if ( ! taxonomy_exists( $name ) ) {
+				return;
+			}
+			$term_ids = wc_get_object_terms( $product_id, $name, 'term_id' );
+			if ( is_wp_error( $term_ids ) || empty( $term_ids ) ) {
+				return;
+			}
+			$position = 0;
+			foreach ( $term_ids as $term_id ) {
+				$term = get_term( (int) $term_id, $name );
+				if ( ! $term || is_wp_error( $term ) ) {
+					continue;
+				}
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->insert(
+					$values_table,
+					array(
+						'product_id'   => $product_id,
+						'attribute_id' => $attribute_row_id,
+						'scope'        => 'product',
+						'value'        => (string) $term->slug,
+						'term_id'      => (int) $term->term_id,
+						'is_default'   => 0,
+						'position'     => $position,
+					),
+					array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+				);
+				++$position;
+			}
+			return;
+		}
+
+		$options  = wc_get_text_attributes( (string) ( $meta_attribute['value'] ?? '' ) );
+		$position = 0;
+		foreach ( $options as $option ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->insert(
+				$values_table,
+				array(
+					'product_id'   => $product_id,
+					'attribute_id' => $attribute_row_id,
+					'scope'        => 'product',
+					'value'        => (string) $option,
+					'term_id'      => null,
+					'is_default'   => 0,
+					'position'     => $position,
+				),
+				array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+			);
+			++$position;
+		}
+	}
+
+	/**
+	 * Insert default-attribute marker rows (`is_default = 1`) for every
+	 * `attribute_name => value` pair in `_default_attributes` postmeta.
+	 *
+	 * Defaults that reference an attribute the product doesn't actually
+	 * carry are silently skipped — that matches the legacy store, which
+	 * orphan-prunes them on the next read.
+	 *
+	 * @param int                   $product_id        Product ID.
+	 * @param array<string, mixed>  $default_attributes Decoded postmeta.
+	 * @param string                $attributes_table  Resolved table name.
+	 * @param string                $values_table      Resolved table name.
+	 * @return void
+	 */
+	private function insert_default_attributes( int $product_id, array $default_attributes, string $attributes_table, string $values_table ): void {
+		global $wpdb;
+
+		foreach ( $default_attributes as $attr_name => $value ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$attribute_row_id = (int) $wpdb->get_var(
+				$wpdb->prepare(
+					'SELECT id FROM %i WHERE product_id = %d AND name = %s LIMIT 1',
+					$attributes_table,
+					$product_id,
+					(string) $attr_name
+				)
+			);
+			if ( $attribute_row_id <= 0 ) {
+				continue;
+			}
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->insert(
+				$values_table,
+				array(
+					'product_id'   => $product_id,
+					'attribute_id' => $attribute_row_id,
+					'scope'        => 'product',
+					'value'        => (string) $value,
+					'term_id'      => null,
+					'is_default'   => 1,
+					'position'     => 0,
+				),
+				array( '%d', '%d', '%s', '%s', '%d', '%d', '%d' )
+			);
+		}
+	}
+
+	/**
+	 * Inverse of {@see mirror_attributes_to_hpps()}: read the side
+	 * tables and reassemble the postmeta blobs `_product_attributes`
+	 * and `_default_attributes` so legacy reads (custom CPT queries,
+	 * REST endpoints not migrated to HPPS, plugins that read postmeta
+	 * directly) keep seeing fresh values.
+	 *
+	 * Empty result sets clear the postmeta entirely (matching the
+	 * legacy `update_or_delete_post_meta()` convention) so a product
+	 * whose attributes were just removed doesn't leave stale arrays
+	 * behind.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return void
+	 */
+	private function mirror_attributes_to_postmeta( int $product_id ): void {
+		global $wpdb;
+
+		$attributes_table = ProductsTableDataStore::get_attributes_table_name();
+		$values_table     = ProductsTableDataStore::get_attribute_values_table_name();
+
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$attribute_rows = $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT id, name, taxonomy, position, is_visible, is_for_variation FROM %i WHERE product_id = %d ORDER BY position ASC, id ASC',
+				$attributes_table,
+				$product_id
+			)
+		);
+
+		if ( empty( $attribute_rows ) ) {
+			$this->clear_attribute_postmeta( $product_id );
+			return;
+		}
+
+		$attribute_ids = array_map( static fn( $row ): int => (int) $row->id, $attribute_rows );
+		$placeholders  = implode( ', ', array_fill( 0, count( $attribute_ids ), '%d' ) );
+
+		$prepared_args = array_merge( array( $values_table, $product_id ), $attribute_ids );
+
+		$values_rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT attribute_id, value, is_default, position FROM %i WHERE product_id = %d AND attribute_id IN ({$placeholders}) AND scope = 'product' ORDER BY position ASC, id ASC",
+				$prepared_args
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		$product_attributes = array();
+		$default_attributes = array();
+
+		foreach ( $attribute_rows as $attribute_row ) {
+			$name         = (string) $attribute_row->name;
+			$is_taxonomy  = ! empty( $attribute_row->taxonomy );
+			$attribute_id = (int) $attribute_row->id;
+			$key          = $is_taxonomy ? $name : sanitize_title( $name );
+
+			$values = array();
+			foreach ( $values_rows as $value_row ) {
+				if ( (int) $value_row->attribute_id !== $attribute_id ) {
+					continue;
+				}
+				if ( 1 === (int) $value_row->is_default ) {
+					$default_attributes[ $key ] = (string) $value_row->value;
+					continue;
+				}
+				$values[] = (string) $value_row->value;
+			}
+
+			$product_attributes[ $key ] = array(
+				'name'         => $name,
+				'value'        => $is_taxonomy ? '' : wc_implode_text_attributes( $values ),
+				'position'     => (int) $attribute_row->position,
+				'is_visible'   => (int) $attribute_row->is_visible,
+				'is_variation' => (int) $attribute_row->is_for_variation,
+				'is_taxonomy'  => $is_taxonomy ? 1 : 0,
+			);
+		}
+
+		self::start_internal_write();
+		try {
+			if ( empty( $product_attributes ) ) {
+				delete_post_meta( $product_id, '_product_attributes' );
+			} else {
+				// wp_slash mirrors the legacy CPT data store's pattern at
+				// `update_attributes()` so update_post_meta sees the same
+				// escape level either path uses.
+				update_post_meta( $product_id, '_product_attributes', wp_slash( $product_attributes ) );
+			}
+
+			if ( empty( $default_attributes ) ) {
+				delete_post_meta( $product_id, '_default_attributes' );
+			} else {
+				update_post_meta( $product_id, '_default_attributes', wp_slash( $default_attributes ) );
+			}
+		} finally {
+			self::end_internal_write();
+		}
+	}
+
+	/**
+	 * Helper for {@see mirror_attributes_to_postmeta()}: drop both
+	 * postmeta blobs when the product has no attributes at all.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return void
+	 */
+	private function clear_attribute_postmeta( int $product_id ): void {
+		self::start_internal_write();
+		try {
+			delete_post_meta( $product_id, '_product_attributes' );
+			delete_post_meta( $product_id, '_default_attributes' );
+		} finally {
+			self::end_internal_write();
+		}
 	}
 
 	/**
