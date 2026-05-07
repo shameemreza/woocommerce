@@ -212,31 +212,50 @@ class ProductsTableVariableDataStore extends ProductsTableDataStore implements W
 			return;
 		}
 
-		// Hydrate each variation, recompute its title from scratch via the
-		// canonical generator (parent name + attribute summary), and write
-		// the new title to both `wc_products.name` and the placeholder
-		// `wp_posts.post_title`. The previous SQL `REPLACE()` approach
-		// did substring substitution, so any variation whose custom name
-		// happened to embed the old parent name (e.g. "Premium Toolkit
-		// Limited Run") got its title corrupted on every parent rename,
-		// and variations with custom names that didn't include the old
-		// parent name didn't get updated at all.
-		$variation_data_store = wc_get_container()->get( ProductsTableVariationDataStore::class );
+		// Hydrate every child variation in one batch and recompute each
+		// title from scratch via the canonical generator (parent name +
+		// attribute summary). The previous SQL `REPLACE()` approach did a
+		// substring substitution, which corrupted custom-named variations
+		// that happened to embed the old parent name (e.g. "Premium
+		// Toolkit Limited Run") and missed any custom-named variation
+		// that didn't include it.
+		//
+		// We reach for `wc_get_products( include )` rather than looping
+		// `wc_get_product()` so the HPPS column reads are batched into a
+		// single SELECT for the whole set — important on parents with
+		// hundreds of variations where the per-id factory loop produced a
+		// real query storm.
+		$child_ids = array_filter( array_map( 'intval', (array) $product->get_children() ) );
+		if ( empty( $child_ids ) ) {
+			$invalidator = wc_get_container()->get( ProductVersionStringInvalidator::class );
+			$invalidator->invalidate( $parent_id );
+			return;
+		}
 
-		$post_types  = array(
+		$variation_data_store = wc_get_container()->get( ProductsTableVariationDataStore::class );
+		$invalidator          = wc_get_container()->get( ProductVersionStringInvalidator::class );
+		$post_types           = array(
 			'product_variation',
 			CustomProductsTableController::PLACEHOLDER_POST_TYPE,
 		);
-		$invalidator = wc_get_container()->get( ProductVersionStringInvalidator::class );
 
-		foreach ( (array) $product->get_children() as $child_id ) {
-			$child_id = (int) $child_id;
-			if ( $child_id <= 0 ) {
+		$variations = wc_get_products(
+			array(
+				'type'    => 'variation',
+				'include' => $child_ids,
+				'limit'   => -1,
+				'orderby' => 'none',
+				'status'  => array_keys( get_post_statuses() ),
+			)
+		);
+
+		foreach ( (array) $variations as $variation ) {
+			if ( ! is_a( $variation, 'WC_Product_Variation' ) ) {
 				continue;
 			}
 
-			$variation = wc_get_product( $child_id );
-			if ( ! $variation || ! is_a( $variation, 'WC_Product_Variation' ) ) {
+			$child_id = (int) $variation->get_id();
+			if ( $child_id <= 0 ) {
 				continue;
 			}
 

@@ -215,6 +215,7 @@ class CustomProductsTableController {
 		// when the post comes back. Hooking `untrashed_post` keeps us in
 		// step with `wp_untrash_post()` for both UI- and CLI-initiated
 		// untrash and for variations untrashed via their parent.
+		add_action( 'wp_trash_post', array( $this, 'on_post_trashed' ), 20, 1 );
 		add_action( 'untrashed_post', array( $this, 'on_post_untrashed' ), 20, 1 );
 	}
 
@@ -229,6 +230,63 @@ class CustomProductsTableController {
 	 * @param int $post_id Post id being untrashed.
 	 * @return void
 	 */
+	/**
+	 * Postmeta key used to snapshot the pre-trash `wc_products.status` so we
+	 * can restore the canonical HPPS status (and not the placeholder's
+	 * possibly-stale `wp_posts.post_status`) when the post is untrashed.
+	 */
+	private const TRASH_META_STATUS_KEY = '_hpps_trash_meta_status';
+
+	/**
+	 * Snapshot the pre-trash HPPS status so {@see on_post_untrashed()} can
+	 * restore the exact status the product was in before it landed in the
+	 * trash.
+	 *
+	 * WordPress already does this for `wp_posts.post_status` via
+	 * `_wp_trash_meta_status`, but the placeholder's `post_status` can lag
+	 * behind `wc_products.status` for products that existed before the H8
+	 * placeholder-status sync fix. Capturing our own snapshot guarantees a
+	 * draft product stays a draft on restore instead of getting silently
+	 * published.
+	 *
+	 * @internal
+	 *
+	 * @param int $post_id Post id about to be trashed.
+	 * @return void
+	 */
+	public function on_post_trashed( $post_id ): void {
+		global $wpdb;
+
+		$post_id = (int) $post_id;
+		if ( $post_id <= 0 ) {
+			return;
+		}
+
+		$post_type = get_post_type( $post_id );
+		if ( ! in_array( $post_type, array( 'product', 'product_placeholder', 'product_variation' ), true ) ) {
+			return;
+		}
+
+		if ( ! $this->custom_product_tables_usage_is_enabled() ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$current_status = $wpdb->get_var(
+			$wpdb->prepare(
+				'SELECT status FROM %i WHERE id = %d LIMIT 1',
+				ProductsTableDataStore::get_products_table_name(),
+				$post_id
+			)
+		);
+
+		if ( ! is_string( $current_status ) || '' === $current_status || 'trash' === $current_status ) {
+			return;
+		}
+
+		update_post_meta( $post_id, self::TRASH_META_STATUS_KEY, $current_status );
+	}
+
 	public function on_post_untrashed( $post_id ): void {
 		global $wpdb;
 
@@ -259,14 +317,25 @@ class CustomProductsTableController {
 			return;
 		}
 
-		$post_status = (string) get_post_status( $post_id );
-		if ( '' === $post_status || 'trash' === $post_status ) {
-			$post_status = 'publish';
+		// Prefer our own snapshot (captured on `wp_trash_post`) so a product
+		// that was `draft` before trash comes back as `draft`, not `publish`.
+		// Fall back to the placeholder's restored `post_status` (which WP
+		// has already populated from `_wp_trash_meta_status`), and only
+		// default to `publish` when nothing usable is available.
+		$snapshot = (string) get_post_meta( $post_id, self::TRASH_META_STATUS_KEY, true );
+		if ( '' !== $snapshot && 'trash' !== $snapshot ) {
+			$post_status = $snapshot;
+		} else {
+			$post_status = (string) get_post_status( $post_id );
+			if ( '' === $post_status || 'trash' === $post_status ) {
+				$post_status = 'publish';
+			}
 		}
+		delete_post_meta( $post_id, self::TRASH_META_STATUS_KEY );
 
-		// Mirror the new wp_posts.post_status onto wc_products.status so the
-		// REST/admin queries that read the column directly stop filtering us
-		// out as trashed.
+		// Mirror the restored status onto wc_products.status so the REST/admin
+		// queries that read the column directly stop filtering us out as
+		// trashed.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->update(
 			ProductsTableDataStore::get_products_table_name(),
@@ -278,6 +347,22 @@ class CustomProductsTableController {
 			array( '%s', '%s' ),
 			array( '%d' )
 		);
+
+		// Keep the placeholder post in step too — `wp_untrash_post()`
+		// restored it from `_wp_trash_meta_status` (which can disagree
+		// with our snapshot for legacy rows), so if our snapshot won we
+		// also need to push that status back onto wp_posts.
+		if ( '' !== $snapshot && get_post_status( $post_id ) !== $post_status ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->update(
+				$wpdb->posts,
+				array( 'post_status' => $post_status ),
+				array( 'ID' => $post_id ),
+				array( '%s' ),
+				array( '%d' )
+			);
+			clean_post_cache( $post_id );
+		}
 
 		$this->simple_data_store->update_lookup_table( $post_id );
 	}
@@ -361,8 +446,23 @@ class CustomProductsTableController {
 		if ( $this->data_synchronizer->get_table_exists() ) {
 			return;
 		}
-		$attempted = true;
+
+		// Run the install pass. We always set `$attempted = true` after the
+		// call (one attempt per request is the contract — dbDelta is too
+		// expensive to retry inside the same hit), but only *after* we've
+		// verified the install actually succeeded. If `dbDelta` failed for
+		// any of the five HPPS tables, log a loud warning so the operator
+		// can intervene before subsequent code paths run against a partial
+		// schema and produce confusing errors.
 		$this->ensure_tables_and_enqueue_migration();
+		$attempted = true;
+
+		if ( ! $this->data_synchronizer->check_products_table_exists() ) {
+			wc_get_logger()->error(
+				__( 'HPPS self-heal failed: the products table is still missing after dbDelta. Check the database user has CREATE privileges and review the WooCommerce logs for dbDelta output.', 'woocommerce' ),
+				array( 'source' => 'hpps' )
+			);
+		}
 	}
 
 	/*
@@ -408,8 +508,7 @@ class CustomProductsTableController {
 		?>
 		<div class="notice notice-warning">
 			<p>
-				<strong><?php esc_html_e( 'High-performance product storage', 'woocommerce' ); ?></strong>
-				—
+				<strong><?php esc_html_e( 'High-performance product storage', 'woocommerce' ); ?>:</strong>
 				<?php
 				echo esc_html(
 					sprintf(
@@ -459,6 +558,18 @@ class CustomProductsTableController {
 			return;
 		}
 
+		// Defense in depth: this handler hooks into `woocommerce_sections_advanced`,
+		// which fires for any settings tab. A non-manager user who somehow has a
+		// valid nonce (leak, shared link, future settings tab that exposes the
+		// page to lower roles) shouldn't be able to start or stop the sync. Pin
+		// the same capability HPOS uses for parity.
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			WC_Admin_Settings::add_error(
+				__( 'You do not have permission to manage HPPS sync.', 'woocommerce' )
+			);
+			return;
+		}
+
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- handled below.
 		$nonce = isset( $_GET['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_GET['_wpnonce'] ) ) : '';
 		if ( ! wp_verify_nonce( $nonce, "hpps-{$action}" ) ) {
@@ -473,6 +584,15 @@ class CustomProductsTableController {
 		if ( 'sync-now' === $action ) {
 			if ( ! $this->data_synchronizer->check_products_table_exists() && ! $this->data_synchronizer->create_database_tables() ) {
 				WC_Admin_Settings::add_error( __( 'Unable to create the HPPS tables for sync. Check the WooCommerce logs for details.', 'woocommerce' ) );
+				return;
+			}
+
+			// If a batch is already queued, don't re-enqueue — Action
+			// Scheduler will dedupe by hook+args, but the operator needs
+			// honest feedback. "Queued" implies fresh work; "already in
+			// progress" reflects reality.
+			if ( $this->data_synchronizer->is_background_migration_enqueued() ) {
+				WC_Admin_Settings::add_message( __( 'Product sync to HPPS is already in progress.', 'woocommerce' ) );
 				return;
 			}
 
@@ -522,7 +642,7 @@ class CustomProductsTableController {
 	public function add_hpps_tools( array $tools_array ): array {
 		$tools_array['sync_products_to_hpps'] = array(
 			'name'             => __( 'Sync products to HPPS', 'woocommerce' ),
-			'desc'             => __( 'Copy any products that are still in wp_posts/wp_postmeta into the HPPS tables. Safe to run repeatedly — already-migrated products are skipped.', 'woocommerce' ),
+			'desc'             => __( 'Copy any products that are still in wp_posts/wp_postmeta into the HPPS tables. Safe to run repeatedly; already-migrated products are skipped.', 'woocommerce' ),
 			'requires_refresh' => true,
 			'callback'         => function () {
 				if ( ! $this->custom_product_tables_usage_is_enabled() ) {
@@ -554,20 +674,42 @@ class CustomProductsTableController {
 			'button'           => __( 'Verify', 'woocommerce' ),
 		);
 
-		$can_delete = ! $this->custom_product_tables_usage_is_enabled();
+		// `Delete the HPPS tables` is only safe when both:
+		//   1. The feature is turned off (so live writes can't race the drop).
+		//   2. No background migration is queued (so the next Action
+		//      Scheduler tick can't fatal against a missing schema).
+		// We compute the gate state once and surface a precise reason in
+		// the description so operators understand why the button is greyed
+		// out instead of guessing.
+		$feature_off       = ! $this->custom_product_tables_usage_is_enabled();
+		$migration_pending = $this->data_synchronizer->is_background_migration_enqueued();
+		$can_delete        = $feature_off && ! $migration_pending;
+
+		if ( $can_delete ) {
+			$delete_desc = __( 'Drop every HPPS table. To recreate them, re-enable HPPS under Settings → Advanced → Features.', 'woocommerce' );
+		} elseif ( ! $feature_off ) {
+			$delete_desc = __( 'HPPS tables can only be deleted when the feature is turned off (Settings → Advanced → Features).', 'woocommerce' );
+		} else {
+			$delete_desc = __( 'A background migration is still queued. Stop it from Settings → Advanced → Features before deleting the tables.', 'woocommerce' );
+		}
+
 		$tools_array['delete_hpps_tables'] = array(
 			'name'             => __( 'Delete the HPPS tables', 'woocommerce' ),
 			'desc'             => sprintf(
 				'<strong class="red">%1$s</strong> %2$s',
 				__( 'Note:', 'woocommerce' ),
-				$can_delete
-					? __( 'Drop every HPPS table. To recreate them, re-enable HPPS under Settings → Advanced → Features.', 'woocommerce' )
-					: __( 'HPPS tables can only be deleted when the feature is turned off (Settings → Advanced → Features).', 'woocommerce' )
+				$delete_desc
 			),
 			'requires_refresh' => true,
-			'callback'         => function () use ( $can_delete ) {
-				if ( ! $can_delete ) {
-					return __( 'HPPS is currently enabled — cannot delete its tables.', 'woocommerce' );
+			'callback'         => function () use ( $feature_off ) {
+				if ( ! $feature_off ) {
+					return __( 'HPPS is currently enabled. Cannot delete its tables.', 'woocommerce' );
+				}
+				// Re-check the queue at execution time — a sync may have
+				// been enqueued between the page render and the click.
+				if ( $this->data_synchronizer->is_background_migration_enqueued() ) {
+					$this->data_synchronizer->dequeue_background_migration();
+					return __( 'A background migration was still queued. Stop it from Settings → Advanced → Features and try again.', 'woocommerce' );
 				}
 				$this->data_synchronizer->delete_database_tables();
 				return __( 'HPPS tables have been deleted.', 'woocommerce' );
@@ -597,7 +739,7 @@ class CustomProductsTableController {
 			return esc_html__( 'HPPS is not enabled. Turn it on under WooCommerce → Settings → Advanced → Features before verifying.', 'woocommerce' );
 		}
 		if ( ! $this->data_synchronizer->check_products_table_exists() ) {
-			return esc_html__( 'HPPS tables are not set up yet — turn the feature on first so they can be created.', 'woocommerce' );
+			return esc_html__( 'HPPS tables are not set up yet. Turn the feature on first so they can be created.', 'woocommerce' );
 		}
 
 		// Sample size: 25 keeps the request well under the admin-page time
@@ -638,15 +780,18 @@ class CustomProductsTableController {
 			);
 		}
 
-		// Use one composite message rather than two paragraphs because the
-		// admin notice container collapses double <br> sequences.
+		// `WC_Admin_Status` echoes the tool response through `esc_html()` so
+		// any HTML markup we hand back lands on screen as literal entities
+		// (`&lt;code&gt;`). We can't change the upstream renderer without
+		// risking other tools' output, so spell the CLI invocation in
+		// backticks — it stays readable and avoids the escaped-HTML cliff.
 		return sprintf(
-			/* translators: 1: number of mismatched products; 2: number of products checked; 3: comma-separated preview of the first mismatched products; 4: <code>wp wc hpps verify</code>. */
+			/* translators: 1: number of mismatched products; 2: number of products checked; 3: comma-separated preview of the first mismatched products; 4: literal `wp wc hpps verify` CLI invocation. */
 			esc_html__( 'Found %1$d mismatched product(s) out of %2$d checked. First mismatches: %3$s. Run %4$s for the full diff.', 'woocommerce' ),
 			count( $report['mismatches'] ),
 			(int) $report['checked'],
 			implode( '; ', $preview_chunks ),
-			'<code>wp wc hpps verify</code>'
+			'`wp wc hpps verify`'
 		);
 	}
 
@@ -710,7 +855,7 @@ class CustomProductsTableController {
 
 		$features_controller->add_feature_definition(
 			self::FEATURE_ID,
-			__( 'High-Performance product storage', 'woocommerce' ),
+			__( 'High-performance product storage', 'woocommerce' ),
 			$definition
 		);
 	}
@@ -807,7 +952,7 @@ class CustomProductsTableController {
 
 		$pending = $this->data_synchronizer->get_pending_count();
 		if ( $pending <= 0 ) {
-			return esc_html__( 'All products are synchronised with the HPPS tables.', 'woocommerce' );
+			return esc_html__( 'All products are synchronized with the HPPS tables.', 'woocommerce' );
 		}
 
 		$features_page_url = $this->features_controller->get_features_page_url();

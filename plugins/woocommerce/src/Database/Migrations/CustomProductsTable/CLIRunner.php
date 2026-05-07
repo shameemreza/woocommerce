@@ -236,8 +236,22 @@ class CLIRunner {
 
 		$single_id = isset( $assoc_args['id'] ) ? (int) $assoc_args['id'] : 0;
 		$limit     = isset( $assoc_args['limit'] ) ? max( 0, (int) $assoc_args['limit'] ) : 100;
-		$format    = $assoc_args['format'] ?? 'table';
-		$ignore    = isset( $assoc_args['ignore'] )
+		$format    = (string) ( $assoc_args['format'] ?? 'table' );
+		// Match the upstream `wp` formatter contract — `WP_CLI\Utils\format_items()`
+		// supports table, csv, json, yaml, count, and ids. Reject anything
+		// else with a clear error so a typo surfaces immediately instead of
+		// silently falling through to table output.
+		$supported_formats = array( 'table', 'csv', 'json', 'yaml', 'count', 'ids' );
+		if ( ! in_array( $format, $supported_formats, true ) ) {
+			WP_CLI::error(
+				sprintf(
+					'Unsupported --format=%s. Supported formats: %s.',
+					$format,
+					implode( ', ', $supported_formats )
+				)
+			);
+		}
+		$ignore = isset( $assoc_args['ignore'] )
 			? array_filter( array_map( 'trim', explode( ',', (string) $assoc_args['ignore'] ) ) )
 			: array( 'date_modified', 'date_modified_gmt' );
 
@@ -257,8 +271,13 @@ class CLIRunner {
 		WP_CLI::log( sprintf( 'Posts not yet in wc_products: %d', $counts['pending'] ) );
 
 		if ( 0 === $report['checked'] ) {
-			WP_CLI::log( 'No HPPS products to verify yet.' );
-			return;
+			// Distinguish "everything passed" (exit 0, success) from
+			// "we didn't actually check anything" (exit 2, warning).
+			// Operators piping through CI/scripts need the difference
+			// — a green build with zero verifications gives false
+			// confidence on a fresh database.
+			WP_CLI::warning( 'No HPPS products to verify yet — nothing was checked.' );
+			WP_CLI::halt( 2 );
 		}
 
 		if ( empty( $report['mismatches'] ) ) {
@@ -273,11 +292,6 @@ class CLIRunner {
 				$report['checked']
 			)
 		);
-
-		if ( 'json' === $format ) {
-			WP_CLI::log( wp_json_encode( $report['mismatches'], JSON_PRETTY_PRINT ) );
-			WP_CLI::halt( 1 );
-		}
 
 		$rows = array();
 		foreach ( $report['mismatches'] as $entry ) {
@@ -300,7 +314,9 @@ class CLIRunner {
 			}
 		}
 
-		WP_CLI\Utils\format_items( 'table', $rows, array( 'id', 'field', 'cpt', 'hpps' ) );
+		// Hand the chosen format through to the upstream formatter so
+		// `--format=csv|yaml|json|count|ids` all work.
+		WP_CLI\Utils\format_items( $format, $rows, array( 'id', 'field', 'cpt', 'hpps' ) );
 		WP_CLI::halt( 1 );
 	}
 }

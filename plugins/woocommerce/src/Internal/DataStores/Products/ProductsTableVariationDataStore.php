@@ -196,45 +196,55 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 		$this->load_parent_data( $product );
 
 		// Generated title may have drifted since last save (e.g. the parent
-		// product was renamed). Repair lazily so listings show the current
-		// parent name; persist to wc_products only when it differs from the
-		// stored value.
+		// product was renamed). Update the in-memory product so the caller
+		// sees the canonical title; only *persist* the repair when we're
+		// running on a privileged surface (admin / WP-CLI). Front-end GETs
+		// must stay read-only — turning a product page hit into a multi-
+		// table write would amplify cold-cache traffic into write storms,
+		// fight write locks during high concurrency, and break replicas
+		// running read-only. The persisted repair will happen on the next
+		// admin save, the next CLI verify run, or via the parent's
+		// `sync_variation_names()` rename path.
 		$new_title = $this->generate_product_title( $product );
 		if ( $row->name !== $new_title ) {
 			$product->set_name( $new_title );
 
-			// Mirror to the `product_placeholder` post and clear product
-			// caches so anything that already read the stale title from
-			// `get_post()` or transient caches (admin lists, REST, the
-			// variations dropdown) picks up the corrected version on the
-			// next request. Bracket the writes with `start_internal_write`
-			// so the postmeta listener doesn't try to bounce the change
-			// back into the same row.
-			ProductDataSyncListener::start_internal_write();
-			try {
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->update(
-					self::get_products_table_name(),
-					array( 'name' => $new_title ),
-					array( 'id' => $product_id ),
-					array( '%s' ),
-					array( '%d' )
-				);
+			$is_privileged_surface = ( defined( 'WP_CLI' ) && WP_CLI )
+				|| ( function_exists( 'is_admin' ) && is_admin() && ! wp_doing_ajax() );
 
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$wpdb->update(
-					$wpdb->posts,
-					array( 'post_title' => $new_title ),
-					array( 'ID' => $product_id ),
-					array( '%s' ),
-					array( '%d' )
-				);
-				clean_post_cache( $product_id );
-			} finally {
-				ProductDataSyncListener::end_internal_write();
+			if ( $is_privileged_surface ) {
+				// Mirror to wc_products and the placeholder post and clear
+				// product caches so admin lists, REST, and the variations
+				// dropdown pick up the corrected version. Bracket the
+				// writes with `start_internal_write` so the postmeta
+				// listener doesn't try to bounce the change back into the
+				// same row.
+				ProductDataSyncListener::start_internal_write();
+				try {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$wpdb->update(
+						self::get_products_table_name(),
+						array( 'name' => $new_title ),
+						array( 'id' => $product_id ),
+						array( '%s' ),
+						array( '%d' )
+					);
+
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+					$wpdb->update(
+						$wpdb->posts,
+						array( 'post_title' => $new_title ),
+						array( 'ID' => $product_id ),
+						array( '%s' ),
+						array( '%d' )
+					);
+					clean_post_cache( $product_id );
+				} finally {
+					ProductDataSyncListener::end_internal_write();
+				}
+
+				$this->clear_caches( $product );
 			}
-
-			$this->clear_caches( $product );
 		}
 
 		$product->set_object_read( true );
@@ -367,6 +377,11 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 		if ( $parent_id > 0 ) {
 			$this->update_lookup_table( $parent_id );
 		}
+
+		// Variation paths route through the parent's `fire_stock_hooks()` so
+		// `woocommerce_variation_set_stock` and `woocommerce_variation_set_stock_status`
+		// fire whenever stock_quantity / stock_status was in the changeset.
+		$this->fire_stock_hooks( $product, $changes );
 
 		/**
 		 * Fires after a product variation is updated via HPPS.

@@ -967,6 +967,8 @@ CREATE TABLE {$meta_table} (
 		$this->update_lookup_table( $product->get_id() );
 		$this->clear_caches( $product );
 
+		$this->fire_stock_hooks( $product, $changes );
+
 		$new_status = $product->get_status();
 		if ( $previous_status && $previous_status !== $new_status ) {
 			/**
@@ -994,6 +996,55 @@ CREATE TABLE {$meta_table} (
 		 * @param WC_Product $product    Product object.
 		 */
 		do_action( 'woocommerce_update_product', $product->get_id(), $product );
+	}
+
+	/**
+	 * Mirror the legacy CPT data store's stock-change action surface so any
+	 * extension hooked into `woocommerce_product_set_stock`,
+	 * `woocommerce_variation_set_stock`, `woocommerce_product_set_stock_status`,
+	 * or `woocommerce_variation_set_stock_status` keeps firing under HPPS.
+	 *
+	 * The CPT store fires these from `handle_updated_props()` when the
+	 * matching property is part of `$updated_props`. Our `update()` paths
+	 * already track the changeset, so we bridge the same contract:
+	 *
+	 *  - `stock_quantity` in `$changes` → set_stock / variation_set_stock.
+	 *  - `stock_status`   in `$changes` → set_stock_status / variation_set_stock_status.
+	 *
+	 * Subclasses (`ProductsTableVariationDataStore`) override the variation
+	 * detection only when needed; the base implementation matches the CPT
+	 * `is_type( 'variation' )` check.
+	 *
+	 * Direct stock writes via {@see update_product_stock()} intentionally do
+	 * not fire these hooks — neither does the legacy CPT path — only
+	 * `woocommerce_updated_product_stock`, which we already emit there.
+	 *
+	 * @param WC_Product           $product Product whose changes we just persisted.
+	 * @param array<string, mixed> $changes Snapshot of changed props from `get_changes()` taken before `apply_changes()`.
+	 * @return void
+	 */
+	protected function fire_stock_hooks( $product, array $changes ): void {
+		$is_variation = is_a( $product, 'WC_Product_Variation' );
+
+		if ( array_key_exists( 'stock_quantity', $changes ) ) {
+			if ( $is_variation ) {
+				/** This filter is documented in includes/data-stores/class-wc-product-data-store-cpt.php */
+				do_action( 'woocommerce_variation_set_stock', $product );
+			} else {
+				/** This filter is documented in includes/data-stores/class-wc-product-data-store-cpt.php */
+				do_action( 'woocommerce_product_set_stock', $product );
+			}
+		}
+
+		if ( array_key_exists( 'stock_status', $changes ) ) {
+			if ( $is_variation ) {
+				/** This filter is documented in includes/data-stores/class-wc-product-data-store-cpt.php */
+				do_action( 'woocommerce_variation_set_stock_status', $product->get_id(), $product->get_stock_status(), $product );
+			} else {
+				/** This filter is documented in includes/data-stores/class-wc-product-data-store-cpt.php */
+				do_action( 'woocommerce_product_set_stock_status', $product->get_id(), $product->get_stock_status(), $product );
+			}
+		}
 	}
 
 	/**
