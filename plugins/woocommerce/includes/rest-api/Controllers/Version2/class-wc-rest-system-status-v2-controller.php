@@ -13,7 +13,8 @@ defined( 'ABSPATH' ) || exit;
 use Automattic\WooCommerce\Internal\WCCom\ConnectionHelper;
 use Automattic\WooCommerce\Internal\ProductDownloads\ApprovedDirectories\Register as Download_Directories;
 use Automattic\WooCommerce\Internal\DataStores\Orders\DataSynchronizer as Order_DataSynchronizer;
-use Automattic\WooCommerce\Utilities\{ LoggingUtil, OrderUtil, PluginUtil };
+use Automattic\WooCommerce\Internal\DataStores\Products\ProductDataSynchronizer as Product_DataSynchronizer;
+use Automattic\WooCommerce\Utilities\{ LoggingUtil, OrderUtil, PluginUtil, ProductUtil };
 use Automattic\WooCommerce\Blocks\Utils\CartCheckoutUtils;
 use Automattic\WooCommerce\Enums\DefaultCustomerAddress;
 use Automattic\WooCommerce\Internal\Features\FeaturesController;
@@ -673,6 +674,30 @@ class WC_REST_System_Status_V2_Controller extends WC_REST_Controller {
 						'HPOS_sync_enabled'              => array(
 							'description' => __( 'Is HPOS sync enabled?', 'woocommerce' ),
 							'type'        => 'boolean',
+							'context'     => array( 'view' ),
+							'readonly'    => true,
+						),
+						'HPPS_enabled'                   => array(
+							'description' => __( 'Is HPPS enabled?', 'woocommerce' ),
+							'type'        => 'boolean',
+							'context'     => array( 'view' ),
+							'readonly'    => true,
+						),
+						'product_datastore'              => array(
+							'description' => __( 'Product datastore.', 'woocommerce' ),
+							'type'        => 'string',
+							'context'     => array( 'view' ),
+							'readonly'    => true,
+						),
+						'HPPS_sync_enabled'              => array(
+							'description' => __( 'Is HPPS sync enabled?', 'woocommerce' ),
+							'type'        => 'boolean',
+							'context'     => array( 'view' ),
+							'readonly'    => true,
+						),
+						'HPPS_pending_products'          => array(
+							'description' => __( 'Products that still need to be copied into the HPPS tables.', 'woocommerce' ),
+							'type'        => 'integer',
 							'context'     => array( 'view' ),
 							'readonly'    => true,
 						),
@@ -1493,8 +1518,83 @@ class WC_REST_System_Status_V2_Controller extends WC_REST_Controller {
 			'order_datastore'                => WC_Data_Store::load( 'order' )->get_current_class_name(),
 			'HPOS_enabled'                   => OrderUtil::custom_orders_table_usage_is_enabled(),
 			'HPOS_sync_enabled'              => wc_get_container()->get( Order_DataSynchronizer::class )->data_sync_is_enabled(),
+			'HPPS_enabled'                   => $this->get_hpps_status_enabled(),
+			'product_datastore'              => $this->get_hpps_status_product_datastore(),
+			'HPPS_sync_enabled'              => $this->get_hpps_status_sync_enabled(),
+			'HPPS_pending_products'          => $this->get_hpps_status_pending_products(),
 			'enabled_features'               => $enabled_features_slugs,
 		);
+	}
+
+	/**
+	 * Whether the High-Performance Product Storage feature is currently active.
+	 *
+	 * Wrapped in a try/catch so a broken HPPS DI graph or a partially-installed
+	 * environment can never blow up the System Status endpoint — System Status
+	 * is the place merchants go *because* something is broken.
+	 *
+	 * @return bool
+	 */
+	protected function get_hpps_status_enabled() {
+		if ( ! class_exists( ProductUtil::class ) ) {
+			return false;
+		}
+		try {
+			return ProductUtil::is_hpps_enabled();
+		} catch ( \Throwable $e ) {
+			return false;
+		}
+	}
+
+	/**
+	 * Class name of the data store currently serving product reads/writes.
+	 *
+	 * @return string
+	 */
+	protected function get_hpps_status_product_datastore() {
+		try {
+			return WC_Data_Store::load( 'product' )->get_current_class_name();
+		} catch ( \Throwable $e ) {
+			return '';
+		}
+	}
+
+	/**
+	 * Whether the HPPS data-sync option is on (mirrors third-party postmeta
+	 * writes back into the wc_products columns).
+	 *
+	 * @return bool
+	 */
+	protected function get_hpps_status_sync_enabled() {
+		if ( ! class_exists( Product_DataSynchronizer::class ) ) {
+			return false;
+		}
+		try {
+			return wc_get_container()->get( Product_DataSynchronizer::class )->data_sync_is_enabled();
+		} catch ( \Throwable $e ) {
+			return false;
+		}
+	}
+
+	/**
+	 * Number of products still waiting to be migrated into the HPPS tables.
+	 * Returns zero when HPPS is off or its tables don't exist yet.
+	 *
+	 * @return int
+	 */
+	protected function get_hpps_status_pending_products() {
+		if ( ! class_exists( Product_DataSynchronizer::class ) ) {
+			return 0;
+		}
+		try {
+			$synchronizer = wc_get_container()->get( Product_DataSynchronizer::class );
+			if ( ! $synchronizer->get_table_exists() ) {
+				return 0;
+			}
+			return (int) $synchronizer->get_pending_count();
+		} catch ( \Throwable $e ) {
+			return 0;
+		}
 	}
 
 	/**

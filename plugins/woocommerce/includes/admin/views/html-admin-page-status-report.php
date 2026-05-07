@@ -793,6 +793,27 @@ if ( 0 < $mu_plugins_count ) :
 		</tr>
 
 		<tr>
+			<td data-export-label="HPPS feature enabled"><?php esc_html_e( 'HPPS enabled:', 'woocommerce' ); ?></td>
+			<td class="help"><?php echo wc_help_tip( esc_html__( 'Is High-Performance Product Storage enabled?', 'woocommerce' ) ); ?></td>
+			<td><?php echo ! empty( $settings['HPPS_enabled'] ) ? '<mark class="yes"><span class="dashicons dashicons-yes"></span></mark>' : '<mark class="no">&ndash;</mark>'; ?></td>
+		</tr>
+		<tr>
+			<td data-export-label="Product datastore"><?php esc_html_e( 'Product datastore:', 'woocommerce' ); ?></td>
+			<td class="help"><?php echo wc_help_tip( esc_html__( 'Datastore currently in use for products.', 'woocommerce' ) ); ?></td>
+			<td><?php echo esc_html( isset( $settings['product_datastore'] ) ? $settings['product_datastore'] : '' ); ?></td>
+		</tr>
+		<tr>
+			<td data-export-label="HPPS data sync enabled"><?php esc_html_e( 'HPPS data sync enabled:', 'woocommerce' ); ?></td>
+			<td class="help"><?php echo wc_help_tip( esc_html__( 'Is data sync enabled for HPPS?', 'woocommerce' ) ); ?></td>
+			<td><?php echo ! empty( $settings['HPPS_sync_enabled'] ) ? '<mark class="yes"><span class="dashicons dashicons-yes"></span></mark>' : '<mark class="no">&ndash;</mark>'; ?></td>
+		</tr>
+		<tr>
+			<td data-export-label="HPPS pending products"><?php esc_html_e( 'HPPS pending products:', 'woocommerce' ); ?></td>
+			<td class="help"><?php echo wc_help_tip( esc_html__( 'Products that still need to be copied into the HPPS tables. Zero means the migration is complete.', 'woocommerce' ) ); ?></td>
+			<td><?php echo esc_html( number_format_i18n( isset( $settings['HPPS_pending_products'] ) ? (int) $settings['HPPS_pending_products'] : 0 ) ); ?></td>
+		</tr>
+
+		<tr>
 			<td data-export-label="Enabled Features"><?php esc_html_e( 'Enabled features:', 'woocommerce' ); ?></td>
 			<td class="help"><?php echo wc_help_tip( esc_html__( 'Features that are currently enabled.', 'woocommerce' ) ); ?></td>
 			<td><?php echo esc_html( implode( ', ', $settings['enabled_features'] ) ); ?></td>
