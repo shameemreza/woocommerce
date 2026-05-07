@@ -192,7 +192,13 @@ class ProductDataSyncListener {
 			'column' => 'download_expiry',
 			'type'   => 'int',
 		),
-		'_total_sales'           => array(
+		// Note: the legacy CPT data store stores the running counter under the
+		// bare `total_sales` key (no leading underscore — see
+		// WC_Product_Data_Store_CPT::update_product_sales). Mapping the wrong
+		// key here silently dropped every checkout's update on the floor and
+		// drifted best-sellers / sort-by-popularity / analytics until the
+		// next full save.
+		'total_sales'            => array(
 			'column' => 'total_sales',
 			'type'   => 'int',
 		),
