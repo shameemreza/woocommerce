@@ -1098,13 +1098,14 @@ CREATE TABLE {$meta_table} (
 	/**
 	 * Read multiple products in a single round-trip.
 	 *
-	 * The headline performance win of HPPS: shop pages that previously ran
-	 * `1 + n + n*30+` queries per page (one WP_Query, one read per product,
-	 * 30+ postmeta hits per product) collapse to:
-	 *  - 1 SELECT against wc_products
-	 *  - 1 SELECT against wc_products_meta
-	 *  - 1 SELECT against wc_product_attributes
-	 *  - 1 SELECT against wc_product_attribute_values
+	 * Phase 1 batches the columns and downloads into single SELECTs:
+	 *  - 1 SELECT against `wc_products` for every column on every id.
+	 *  - 1 SELECT against `wc_product_downloads` for every download row.
+	 *
+	 * Attribute, meta, and taxonomy reads still loop per product (each is
+	 * a multi-table fan-out that needs more careful batching to avoid
+	 * memory blow-ups on large catalogs); flattening those into single
+	 * SELECTs is a Phase 2 task tracked in HPPS-review-and-plan.md.
 	 *
 	 * @param WC_Product[] $products Indexed array of WC_Product instances passed by reference.
 	 * @return void
@@ -1884,14 +1885,19 @@ CREATE TABLE {$meta_table} (
 	}
 
 	/**
-	 * Batched read_attributes() for read_multiple().
+	 * read_attributes() driver for read_multiple().
+	 *
+	 * Phase 1 still calls `read_attributes()` per product. The two-table
+	 * fan-out (wc_product_attributes joined to wc_product_attribute_values
+	 * with `scope = 'product'`, plus the default-attribute markers) is
+	 * non-trivial to flatten without holding the entire grouped result set
+	 * in memory, so a true batch is deferred to Phase 2 and tracked in
+	 * HPPS-review-and-plan.md.
 	 *
 	 * @param array<int, WC_Product> $products_by_id Products keyed by ID.
 	 * @return void
 	 */
 	protected function read_attributes_for_ids( array $products_by_id ): void {
-		// Phase 1 of read_multiple keeps this delegating per-product. Replacing
-		// it with a single grouped query is a Chunk E perf optimisation.
 		foreach ( $products_by_id as $product ) {
 			$this->read_attributes( $product );
 		}
@@ -2010,12 +2016,59 @@ CREATE TABLE {$meta_table} (
 	/**
 	 * Batched read_downloads() for read_multiple().
 	 *
+	 * Issues one SELECT against `wc_product_downloads` for the entire id
+	 * set rather than running `read_downloads()` per product. Rows are
+	 * grouped by `product_id` in PHP and assigned to the matching product
+	 * with the same `WC_Product_Download` shape `read_downloads()`
+	 * returns.
+	 *
 	 * @param array<int, WC_Product> $products_by_id Products keyed by ID.
 	 * @return void
 	 */
 	protected function read_downloads_for_ids( array $products_by_id ): void {
-		foreach ( $products_by_id as $product ) {
-			$this->read_downloads( $product );
+		global $wpdb;
+
+		$ids = array_keys( $products_by_id );
+		if ( empty( $ids ) ) {
+			return;
+		}
+
+		$placeholder = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT * FROM ' . self::get_downloads_table_name() . " WHERE product_id IN ({$placeholder}) ORDER BY product_id ASC, sort_order ASC, id ASC",
+				...$ids
+			)
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		if ( empty( $rows ) ) {
+			return;
+		}
+
+		$rows_by_pid = array();
+		foreach ( $rows as $row ) {
+			$pid                   = (int) $row->product_id;
+			$rows_by_pid[ $pid ][] = $row;
+		}
+
+		foreach ( $rows_by_pid as $pid => $product_rows ) {
+			if ( ! isset( $products_by_id[ $pid ] ) ) {
+				continue;
+			}
+			$product   = $products_by_id[ $pid ];
+			$downloads = array();
+			foreach ( $product_rows as $row ) {
+				$download = new WC_Product_Download();
+				$download->set_id( (string) $row->download_id );
+				$download->set_name( (string) $row->name ?: wc_get_filename_from_url( (string) $row->file ) );
+				/** This filter is documented in {@see read_downloads()}. */
+				$download->set_file( apply_filters( 'woocommerce_file_download_path', (string) $row->file, $product, (string) $row->download_id ) );
+				$downloads[] = $download;
+			}
+			$product->set_downloads( $downloads );
 		}
 	}
 
