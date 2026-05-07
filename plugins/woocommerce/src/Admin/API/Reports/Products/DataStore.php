@@ -166,7 +166,14 @@ class DataStore extends ReportsDataStore implements DataStoreInterface {
 				$join = " JOIN {$wpdb->posts} AS _products ON {$id_cell} = _products.ID";
 				break;
 			case 'sku':
-				$join = " LEFT JOIN {$wpdb->postmeta} AS postmeta ON {$id_cell} = postmeta.post_id AND postmeta.meta_key = '_sku'";
+				// Join `wc_product_meta_lookup` instead of `wp_postmeta` so
+				// the sort still works when High-Performance Product Storage
+				// (HPPS) is the authoritative source: HPPS keeps the lookup
+				// table in lockstep on every write, but skips the
+				// `_sku` postmeta key when compatibility mode is off.
+				// The lookup table is also populated under legacy CPT, so
+				// the join is a strict improvement either way.
+				$join = " LEFT JOIN {$wpdb->prefix}wc_product_meta_lookup AS product_meta_lookup ON {$id_cell} = product_meta_lookup.product_id";
 				break;
 			case 'variations':
 				$type = 'left_join';
@@ -234,7 +241,7 @@ class DataStore extends ReportsDataStore implements DataStoreInterface {
 			return 'post_title';
 		}
 		if ( 'sku' === $order_by ) {
-			return 'meta_value';
+			return 'product_meta_lookup.sku';
 		}
 
 		return $order_by;

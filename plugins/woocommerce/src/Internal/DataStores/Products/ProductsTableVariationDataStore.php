@@ -110,23 +110,51 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 		$data    = $this->build_column_data( $product, true );
 		$formats = $this->build_format_array( $data );
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$wpdb->insert( self::get_products_table_name(), $data, $formats );
+		// Wrap the wc_products + side-table writes plus the parent
+		// price-recompute in a single transaction so a failure mid-create
+		// can't leave a placeholder post pointing at no `wc_products`
+		// row, half-written attribute rows, or a stale parent lookup.
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
-		$this->persist_attributes( $product, true );
-		$this->persist_downloads( $product, true );
-		$this->persist_taxonomy_terms( $product, true );
-		$this->sync_visibility_terms( $product, true );
+		try {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$inserted = $wpdb->insert( self::get_products_table_name(), $data, $formats );
+			if ( false === $inserted ) {
+				throw new Exception(
+					esc_html(
+						sprintf(
+							/* translators: %s: database error message. */
+							__( 'Failed to insert HPPS variation row: %s', 'woocommerce' ),
+							(string) $wpdb->last_error
+						)
+					)
+				);
+			}
 
-		$product->save_meta_data();
-		$product->apply_changes();
+			$this->persist_attributes( $product, true );
+			$this->persist_downloads( $product, true );
+			$this->persist_taxonomy_terms( $product, true );
+			$this->sync_visibility_terms( $product, true );
 
-		$this->update_lookup_table( $product->get_id() );
+			$product->save_meta_data();
+			$product->apply_changes();
 
-		// Variable parent's min/max price may have shifted.
-		$parent_id = (int) $product->get_parent_id();
-		if ( $parent_id > 0 ) {
-			$this->update_lookup_table( $parent_id );
+			$this->update_lookup_table( $product->get_id() );
+
+			// Variable parent's min/max price may have shifted.
+			$parent_id = (int) $product->get_parent_id();
+			if ( $parent_id > 0 ) {
+				$this->update_lookup_table( $parent_id );
+			}
+
+			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		} catch ( \Throwable $e ) {
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+			wp_delete_post( (int) $post_id, true );
+			$product->set_id( 0 );
+
+			throw $e;
 		}
 
 		/**
@@ -301,82 +329,109 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 		// flipped it elsewhere, fix it here so reads keep returning the row.
 		$data['type'] = ProductType::VARIATION;
 
-		if ( count( $data ) > 1 ) {
-			$formats = $this->build_format_array( $data );
+		// Wrap the wc_products UPDATE plus the side-table rebuilds and
+		// the lookup recompute in a transaction. The row-level lock at
+		// the top serialises concurrent updates per variation id so
+		// {@see persist_attributes()}'s delete-then-insert sequence is
+		// atomic.
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		try {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$locked_id = $wpdb->get_var(
+				$wpdb->prepare(
+					'SELECT id FROM ' . self::get_products_table_name() . ' WHERE id = %d FOR UPDATE',
+					(int) $product->get_id()
+				)
+			);
+			if ( null === $locked_id ) {
+				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				return;
+			}
+
+			if ( count( $data ) > 1 ) {
+				$formats = $this->build_format_array( $data );
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->update(
+					self::get_products_table_name(),
+					$data,
+					array( 'id' => (int) $product->get_id() ),
+					$formats,
+					array( '%d' )
+				);
+			}
+
+			// Sync the placeholder post title/excerpt/mtime for compatibility
+			// with the few wp_posts queries (e.g. autosuggest, post-meta-keyed
+			// caches) that still hit it.
+			//
+			// post_parent is conditional: `read()` defensively sets the
+			// in-memory parent_id to 0 when the parent doesn't currently look
+			// like a variable product (e.g. mid-migration, parent in trash,
+			// type temporarily flipped). Writing that 0 back to
+			// `wp_posts.post_parent` permanently orphans the placeholder and
+			// breaks untrash/recovery — so we only persist `post_parent` when
+			// the in-memory value is >0 or the caller explicitly changed it.
+			//
+			// post_modified* always tracks `wc_products.date_modified_gmt` so
+			// `get_post_modified_time()` keeps reporting the canonical mtime.
+			$now_gmt   = $data['date_modified_gmt'];
+			$now_local = get_date_from_gmt( $now_gmt );
+
+			$post_data    = array(
+				'post_title'        => (string) $product->get_name(),
+				'post_excerpt'      => (string) $product->get_attribute_summary( 'edit' ),
+				'menu_order'        => (int) $product->get_menu_order(),
+				'post_status'       => $product->get_status() ? $product->get_status() : ProductStatus::PUBLISH,
+				'post_modified'     => $now_local,
+				'post_modified_gmt' => $now_gmt,
+			);
+			$post_formats = array( '%s', '%s', '%d', '%s', '%s', '%s' );
+
+			$new_parent = (int) $product->get_parent_id();
+			if ( $new_parent > 0 || array_key_exists( 'parent_id', $changes ) ) {
+				$post_data['post_parent'] = $new_parent;
+				$post_formats[]           = '%d';
+			}
+
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$wpdb->update(
-				self::get_products_table_name(),
-				$data,
-				array( 'id' => (int) $product->get_id() ),
-				$formats,
+				$wpdb->posts,
+				$post_data,
+				array( 'ID' => (int) $product->get_id() ),
+				$post_formats,
 				array( '%d' )
 			);
+
+			if ( array_key_exists( 'attributes', $changes ) ) {
+				$this->persist_attributes( $product );
+			}
+			if ( array_key_exists( 'downloads', $changes ) ) {
+				$this->persist_downloads( $product );
+			}
+			if ( array_key_exists( 'shipping_class_id', $changes ) ) {
+				$this->persist_taxonomy_terms( $product );
+			}
+			if ( array_key_exists( 'stock_status', $changes ) ) {
+				$this->sync_visibility_terms( $product );
+			}
+
+			$product->apply_changes();
+
+			$this->update_lookup_table( $product->get_id() );
+
+			$parent_id = (int) $product->get_parent_id();
+			if ( $parent_id > 0 ) {
+				$this->update_lookup_table( $parent_id );
+			}
+
+			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		} catch ( \Throwable $e ) {
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			throw $e;
 		}
 
-		// Sync the placeholder post title/excerpt/mtime for compatibility
-		// with the few wp_posts queries (e.g. autosuggest, post-meta-keyed
-		// caches) that still hit it.
-		//
-		// post_parent is conditional: `read()` defensively sets the
-		// in-memory parent_id to 0 when the parent doesn't currently look
-		// like a variable product (e.g. mid-migration, parent in trash,
-		// type temporarily flipped). Writing that 0 back to
-		// `wp_posts.post_parent` permanently orphans the placeholder and
-		// breaks untrash/recovery — so we only persist `post_parent` when
-		// the in-memory value is >0 or the caller explicitly changed it.
-		//
-		// post_modified* always tracks `wc_products.date_modified_gmt` so
-		// `get_post_modified_time()` keeps reporting the canonical mtime.
-		$now_gmt   = $data['date_modified_gmt'];
-		$now_local = get_date_from_gmt( $now_gmt );
-
-		$post_data    = array(
-			'post_title'        => (string) $product->get_name(),
-			'post_excerpt'      => (string) $product->get_attribute_summary( 'edit' ),
-			'menu_order'        => (int) $product->get_menu_order(),
-			'post_status'       => $product->get_status() ? $product->get_status() : ProductStatus::PUBLISH,
-			'post_modified'     => $now_local,
-			'post_modified_gmt' => $now_gmt,
-		);
-		$post_formats = array( '%s', '%s', '%d', '%s', '%s', '%s' );
-
-		$new_parent = (int) $product->get_parent_id();
-		if ( $new_parent > 0 || array_key_exists( 'parent_id', $changes ) ) {
-			$post_data['post_parent'] = $new_parent;
-			$post_formats[]           = '%d';
-		}
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$wpdb->update(
-			$wpdb->posts,
-			$post_data,
-			array( 'ID' => (int) $product->get_id() ),
-			$post_formats,
-			array( '%d' )
-		);
 		clean_post_cache( $product->get_id() );
-
-		if ( array_key_exists( 'attributes', $changes ) ) {
-			$this->persist_attributes( $product );
-		}
-		if ( array_key_exists( 'downloads', $changes ) ) {
-			$this->persist_downloads( $product );
-		}
-		if ( array_key_exists( 'shipping_class_id', $changes ) ) {
-			$this->persist_taxonomy_terms( $product );
-		}
-		if ( array_key_exists( 'stock_status', $changes ) ) {
-			$this->sync_visibility_terms( $product );
-		}
-
-		$product->apply_changes();
-
-		$this->update_lookup_table( $product->get_id() );
-
-		$parent_id = (int) $product->get_parent_id();
-		if ( $parent_id > 0 ) {
-			$this->update_lookup_table( $parent_id );
-		}
 
 		// Variation paths route through the parent's `fire_stock_hooks()` so
 		// `woocommerce_variation_set_stock` and `woocommerce_variation_set_stock_status`

@@ -539,4 +539,61 @@ class ProductsTableDataStoreTests extends HppsTestCase {
 		$reloaded->read( $check );
 		$this->assertEquals( 77, (float) $check->get_regular_price() );
 	}
+
+	/**
+	 * @testdox N1 — update() fires woocommerce_product_set_stock and woocommerce_product_set_stock_status with three args (id, stock, product).
+	 *
+	 * Round-2 added `fire_stock_hooks()` to the HPPS update path so any
+	 * extension hooked into the legacy stock actions keeps working. The
+	 * N1 audit confirmed parity with CPT (3-arg signature, fires after
+	 * apply_changes()). Without a controller-level test that captures
+	 * the args, deleting `fire_stock_hooks( $product, $changes )` from
+	 * update() would still leave the data-store CRUD tests green.
+	 */
+	public function test_update_fires_stock_hooks_with_full_arg_set(): void {
+		$product = WC_Helper_Product::create_simple_product(
+			true,
+			array(
+				'name'         => 'N1 Stock Hooks',
+				'sku'          => 'HPPS-N1-STOCK',
+				'manage_stock' => true,
+			)
+		);
+		$this->do_hpps_sync();
+
+		$qty_calls    = array();
+		$status_calls = array();
+
+		$qty_listener = function ( $product_id, $stock_quantity, $product_obj ) use ( &$qty_calls ): void {
+			$qty_calls[] = array( $product_id, $stock_quantity, is_object( $product_obj ) ? get_class( $product_obj ) : null );
+		};
+		$status_listener = function ( $product_id, $stock_status, $product_obj ) use ( &$status_calls ): void {
+			$status_calls[] = array( $product_id, $stock_status, is_object( $product_obj ) ? get_class( $product_obj ) : null );
+		};
+
+		add_action( 'woocommerce_product_set_stock', $qty_listener, 10, 3 );
+		add_action( 'woocommerce_product_set_stock_status', $status_listener, 10, 3 );
+
+		$reloaded = wc_get_product( $product->get_id() );
+		$reloaded->set_stock_quantity( 42 );
+		$reloaded->set_stock_status( ProductStockStatus::ON_BACKORDER );
+		$reloaded->save();
+
+		remove_action( 'woocommerce_product_set_stock', $qty_listener, 10 );
+		remove_action( 'woocommerce_product_set_stock_status', $status_listener, 10 );
+
+		$this->assertNotEmpty( $qty_calls, 'N1 regression: woocommerce_product_set_stock must fire on stock_quantity changes.' );
+		$this->assertNotEmpty( $status_calls, 'N1 regression: woocommerce_product_set_stock_status must fire on stock_status changes.' );
+
+		// 3-arg parity with CPT: id (int), value, WC_Product instance.
+		$last_qty = end( $qty_calls );
+		$this->assertSame( $product->get_id(), (int) $last_qty[0], 'Stock hook must receive the product id as the first arg.' );
+		$this->assertSame( 42, (int) $last_qty[1], 'Stock hook must receive the new stock quantity as the second arg.' );
+		$this->assertSame( 'WC_Product_Simple', (string) $last_qty[2], 'Stock hook must receive a WC_Product instance as the third arg.' );
+
+		$last_status = end( $status_calls );
+		$this->assertSame( $product->get_id(), (int) $last_status[0] );
+		$this->assertSame( ProductStockStatus::ON_BACKORDER, (string) $last_status[1] );
+		$this->assertSame( 'WC_Product_Simple', (string) $last_status[2] );
+	}
 }

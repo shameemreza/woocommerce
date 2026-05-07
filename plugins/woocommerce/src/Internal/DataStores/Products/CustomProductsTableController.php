@@ -217,6 +217,19 @@ class CustomProductsTableController {
 		// untrash and for variations untrashed via their parent.
 		add_action( 'wp_trash_post', array( $this, 'on_post_trashed' ), 20, 1 );
 		add_action( 'untrashed_post', array( $this, 'on_post_untrashed' ), 20, 1 );
+
+		// Make HPPS-native products visible to every WP_Query-based surface
+		// (REST v3 list endpoints, Store API, ProductCollection block,
+		// `[products]` shortcode family, classic widgets, admin Products
+		// list). Products that are created while HPPS is on land with
+		// `post_type = product_placeholder` to avoid firing the legacy
+		// CPT save chain on every internal write; without this shim they
+		// stay invisible to anything that runs `WP_Query( [ post_type =>
+		// 'product' ] )`. We can't fix every call site one-by-one because
+		// the surface area is large and growing, so we expand the
+		// post_type query var here once and let the underlying SQL pick
+		// up both rows.
+		add_action( 'pre_get_posts', array( $this, 'expand_product_post_type_query' ), 9, 1 );
 	}
 
 	/**
@@ -415,7 +428,16 @@ class CustomProductsTableController {
 	 * @return void
 	 */
 	private function ensure_tables_and_enqueue_migration(): void {
-		if ( ! $this->data_synchronizer->check_products_table_exists() ) {
+		// Re-run dbDelta when either the tables are missing OR the on-disk
+		// schema is at a lower version than the constant in
+		// {@see ProductDataSynchronizer::SCHEMA_VERSION}. Without the
+		// version check, a release that only adds a column would never
+		// trigger dbDelta on installs that already have the tables — the
+		// existence check alone can't see column drift.
+		if (
+			! $this->data_synchronizer->check_products_table_exists()
+			|| ! $this->data_synchronizer->check_schema_is_current()
+		) {
 			$this->data_synchronizer->create_database_tables();
 		}
 
@@ -443,7 +465,14 @@ class CustomProductsTableController {
 		if ( ! $this->custom_product_tables_usage_is_enabled() ) {
 			return;
 		}
-		if ( $this->data_synchronizer->get_table_exists() ) {
+		// Tables already in place at the current schema version — nothing
+		// to do. Otherwise drop into the (idempotent) dbDelta path below
+		// to either create missing tables or pick up new columns / indexes
+		// added in a recent WC release.
+		if (
+			$this->data_synchronizer->get_table_exists()
+			&& $this->data_synchronizer->check_schema_is_current()
+		) {
 			return;
 		}
 
@@ -827,6 +856,81 @@ class CustomProductsTableController {
 				'capability_type'     => 'post',
 			)
 		);
+	}
+
+	/**
+	 * Expand `WP_Query( [ 'post_type' => 'product' ] )` to also include
+	 * `product_placeholder` so HPPS-native products surface everywhere a
+	 * caller bypasses the data-store layer.
+	 *
+	 * Surfaces this fixes in one shot:
+	 *  - REST API v3 list endpoints (`/wc/v3/products`).
+	 *  - Store API list endpoint (`/wc/store/v1/products`).
+	 *  - ProductCollection block frontend render.
+	 *  - `[products]` and the `_category` / `_recent` / `_sale` /
+	 *    `_featured` / `_best_selling` / `_top_rated` shortcode family.
+	 *  - Classic Recently Viewed / Top Rated / Products widgets.
+	 *  - Admin Products list (`wp-admin/edit.php?post_type=product`).
+	 *
+	 * Surfaces NOT affected because they don't run through `WP_Query`:
+	 *  - `wc_get_products()` — already routes through the HPPS data store
+	 *    when the option is on, so adding the placeholder here would
+	 *    double-count.
+	 *  - `WC_Product_Data_Store::get_related_products_query()` — hand-built
+	 *    SQL; covered by the override on
+	 *    {@see ProductsTableDataStore::get_related_products_query()}.
+	 *
+	 * @internal
+	 *
+	 * @param \WP_Query $query Query object about to run. Mutated in place.
+	 * @return void
+	 */
+	public function expand_product_post_type_query( $query ): void {
+		if ( ! ( $query instanceof \WP_Query ) ) {
+			return;
+		}
+
+		if ( ! $this->custom_product_tables_usage_is_enabled() ) {
+			return;
+		}
+
+		$post_type = $query->get( 'post_type' );
+		if ( empty( $post_type ) ) {
+			return;
+		}
+
+		$types = is_array( $post_type )
+			? array_values( array_filter( array_map( 'strval', $post_type ) ) )
+			: array( (string) $post_type );
+
+		if ( ! in_array( 'product', $types, true ) ) {
+			return;
+		}
+
+		if ( in_array( self::PLACEHOLDER_POST_TYPE, $types, true ) ) {
+			return;
+		}
+
+		/**
+		 * Filter whether HPPS expands `post_type=product` queries to also
+		 * include the `product_placeholder` rows used for HPPS-native
+		 * products. Return false to keep the legacy single-post-type
+		 * behaviour (HPPS-native products will then be invisible to that
+		 * call site).
+		 *
+		 * @since 10.9.0
+		 *
+		 * @param bool      $expand True to expand the post type set. Default true.
+		 * @param \WP_Query $query  The query about to run.
+		 */
+		$expand = (bool) apply_filters( 'woocommerce_hpps_include_placeholder_in_product_queries', true, $query );
+		if ( ! $expand ) {
+			return;
+		}
+
+		$types[] = self::PLACEHOLDER_POST_TYPE;
+
+		$query->set( 'post_type', $types );
 	}
 
 	/**

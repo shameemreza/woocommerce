@@ -751,18 +751,52 @@ CREATE TABLE {$meta_table} (
 		$data    = $this->build_column_data( $product, true );
 		$formats = $this->build_format_array( $data );
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$wpdb->insert( self::get_products_table_name(), $data, $formats );
+		// Wrap the wc_products + side-table writes in a transaction so a
+		// failure mid-create (max packet on a giant description, schema
+		// drift, FK constraint) can't leave a placeholder post pointing at
+		// no `wc_products` row, half-written attribute rows, or a stale
+		// lookup row. {@see delete()} uses the same pattern.
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 
-		$this->persist_attributes( $product, true );
-		$this->persist_downloads( $product, true );
-		$this->persist_taxonomy_terms( $product, true );
-		$this->sync_visibility_terms( $product, true );
+		try {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$inserted = $wpdb->insert( self::get_products_table_name(), $data, $formats );
+			if ( false === $inserted ) {
+				throw new Exception(
+					esc_html(
+						sprintf(
+							/* translators: %s: database error message. */
+							__( 'Failed to insert HPPS product row: %s', 'woocommerce' ),
+							(string) $wpdb->last_error
+						)
+					)
+				);
+			}
 
-		$product->save_meta_data();
-		$product->apply_changes();
+			$this->persist_attributes( $product, true );
+			$this->persist_downloads( $product, true );
+			$this->persist_taxonomy_terms( $product, true );
+			$this->sync_visibility_terms( $product, true );
 
-		$this->update_lookup_table( $product->get_id() );
+			$product->save_meta_data();
+			$product->apply_changes();
+
+			$this->update_lookup_table( $product->get_id() );
+
+			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		} catch ( \Throwable $e ) {
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+			// Clean up the placeholder post so a retry with the same
+			// product object isn't blocked by an orphan wp_posts row.
+			// `read()` checks `wc_products` existence first, so leaving
+			// the placeholder behind would also confuse the next read.
+			wp_delete_post( (int) $post_id, true );
+			$product->set_id( 0 );
+
+			throw $e;
+		}
+
 		$this->clear_caches( $product );
 
 		/**
@@ -890,81 +924,119 @@ CREATE TABLE {$meta_table} (
 		// We always touch date_modified_gmt so the timestamp is current.
 		$data['date_modified_gmt'] = gmdate( 'Y-m-d H:i:s' );
 
-		if ( count( $data ) > 1 ) {
-			$formats = $this->build_format_array( $data );
+		// Wrap the wc_products UPDATE plus the side-table rebuilds in a
+		// transaction. Two callers updating the same product concurrently
+		// would otherwise race in `persist_attributes()` (which does a
+		// delete-then-insert sequence and could see another worker's
+		// freshly-inserted rows wiped). The `SELECT … FOR UPDATE` row
+		// lock at the top serialises both writers per product id, so the
+		// attribute rebuild is atomic. {@see delete()} uses the same
+		// pattern.
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+		try {
+			// Take a row-level X lock on this product row before any
+			// further reads or writes. Concurrent updates on the same
+			// product id queue here until we COMMIT or ROLLBACK. A
+			// `null` return means the row was deleted by another worker
+			// between `product_exists_in_hpps()` above and this lock —
+			// bail out cleanly so we don't write orphan rows into the
+			// side tables.
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$locked_id = $wpdb->get_var(
+				$wpdb->prepare(
+					'SELECT id FROM %i WHERE id = %d FOR UPDATE',
+					self::get_products_table_name(),
+					(int) $product->get_id()
+				)
+			);
+			if ( null === $locked_id ) {
+				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				return;
+			}
+
+			if ( count( $data ) > 1 ) {
+				$formats = $this->build_format_array( $data );
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->update(
+					self::get_products_table_name(),
+					$data,
+					array( 'id' => (int) $product->get_id() ),
+					$formats,
+					array( '%d' )
+				);
+			}
+
+			// Keep the placeholder post in step with the product. We mirror:
+			//   * `post_title`        on a name change (so admin previews and the
+			//                         placeholder permalink lookups still surface
+			//                         a sensible label);
+			//   * `post_status`       on a status change (so any code path that
+			//                         uses `get_post_status()` — REST endpoints,
+			//                         third-party plugins, the trash bin UI —
+			//                         stays in sync with `wc_products.status`);
+			//   * `post_modified*`    on every update (so `get_post_modified_time()`
+			//                         and any plugin keying off the placeholder
+			//                         row's mtime mirrors the canonical
+			//                         `wc_products.date_modified_gmt`).
+			// We accumulate the dirty columns and issue a single UPDATE so we
+			// don't pay for multiple round-trips when several change at once.
+			$post_data    = array();
+			$post_formats = array();
+			if ( array_key_exists( 'name', $changes ) ) {
+				$post_data['post_title'] = (string) $product->get_name();
+				$post_formats[]          = '%s';
+			}
+			if ( array_key_exists( 'status', $changes ) ) {
+				$new_status = (string) $product->get_status();
+				if ( '' === $new_status ) {
+					$new_status = 'publish';
+				}
+				$post_data['post_status'] = $new_status;
+				$post_formats[]           = '%s';
+			}
+
+			$now_gmt   = $data['date_modified_gmt'];
+			$now_local = get_date_from_gmt( $now_gmt );
+
+			$post_data['post_modified']     = $now_local;
+			$post_data['post_modified_gmt'] = $now_gmt;
+			$post_formats[]                 = '%s';
+			$post_formats[]                 = '%s';
+
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$wpdb->update(
-				self::get_products_table_name(),
-				$data,
-				array( 'id' => (int) $product->get_id() ),
-				$formats,
+				$wpdb->posts,
+				$post_data,
+				array( 'ID' => (int) $product->get_id() ),
+				$post_formats,
 				array( '%d' )
 			);
-		}
 
-		// Keep the placeholder post in step with the product. We mirror:
-		//   * `post_title`        on a name change (so admin previews and the
-		//                         placeholder permalink lookups still surface
-		//                         a sensible label);
-		//   * `post_status`       on a status change (so any code path that
-		//                         uses `get_post_status()` — REST endpoints,
-		//                         third-party plugins, the trash bin UI —
-		//                         stays in sync with `wc_products.status`);
-		//   * `post_modified*`    on every update (so `get_post_modified_time()`
-		//                         and any plugin keying off the placeholder
-		//                         row's mtime mirrors the canonical
-		//                         `wc_products.date_modified_gmt`).
-		// We accumulate the dirty columns and issue a single UPDATE so we
-		// don't pay for multiple round-trips when several change at once.
-		$post_data    = array();
-		$post_formats = array();
-		if ( array_key_exists( 'name', $changes ) ) {
-			$post_data['post_title'] = (string) $product->get_name();
-			$post_formats[]          = '%s';
-		}
-		if ( array_key_exists( 'status', $changes ) ) {
-			$new_status = (string) $product->get_status();
-			if ( '' === $new_status ) {
-				$new_status = 'publish';
+			if ( array_key_exists( 'attributes', $changes ) || array_key_exists( 'default_attributes', $changes ) ) {
+				$this->persist_attributes( $product );
 			}
-			$post_data['post_status'] = $new_status;
-			$post_formats[]           = '%s';
+			if ( array_key_exists( 'downloads', $changes ) ) {
+				$this->persist_downloads( $product );
+			}
+			if ( array_intersect( array( 'category_ids', 'tag_ids', 'brand_ids', 'shipping_class_id' ), array_keys( $changes ) ) ) {
+				$this->persist_taxonomy_terms( $product );
+			}
+			if ( array_intersect( array( 'featured', 'stock_status', 'average_rating', 'catalog_visibility' ), array_keys( $changes ) ) ) {
+				$this->sync_visibility_terms( $product );
+			}
+
+			$product->apply_changes();
+
+			$this->update_lookup_table( $product->get_id() );
+
+			$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		} catch ( \Throwable $e ) {
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			throw $e;
 		}
 
-		$now_gmt   = $data['date_modified_gmt'];
-		$now_local = get_date_from_gmt( $now_gmt );
-
-		$post_data['post_modified']     = $now_local;
-		$post_data['post_modified_gmt'] = $now_gmt;
-		$post_formats[]                 = '%s';
-		$post_formats[]                 = '%s';
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$wpdb->update(
-			$wpdb->posts,
-			$post_data,
-			array( 'ID' => (int) $product->get_id() ),
-			$post_formats,
-			array( '%d' )
-		);
 		clean_post_cache( $product->get_id() );
-
-		if ( array_key_exists( 'attributes', $changes ) || array_key_exists( 'default_attributes', $changes ) ) {
-			$this->persist_attributes( $product );
-		}
-		if ( array_key_exists( 'downloads', $changes ) ) {
-			$this->persist_downloads( $product );
-		}
-		if ( array_intersect( array( 'category_ids', 'tag_ids', 'brand_ids', 'shipping_class_id' ), array_keys( $changes ) ) ) {
-			$this->persist_taxonomy_terms( $product );
-		}
-		if ( array_intersect( array( 'featured', 'stock_status', 'average_rating', 'catalog_visibility' ), array_keys( $changes ) ) ) {
-			$this->sync_visibility_terms( $product );
-		}
-
-		$product->apply_changes();
-
-		$this->update_lookup_table( $product->get_id() );
 		$this->clear_caches( $product );
 
 		$this->fire_stock_hooks( $product, $changes );
@@ -1201,14 +1273,14 @@ CREATE TABLE {$meta_table} (
 		$ids         = array_keys( $by_id );
 		$placeholder = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 
-		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				'SELECT * FROM ' . self::get_products_table_name() . " WHERE id IN ( {$placeholder} )",
+				"SELECT * FROM %i WHERE id IN ( {$placeholder} )",
+				self::get_products_table_name(),
 				...$ids
 			)
 		);
-		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		foreach ( $rows as $row ) {
 			$row_id = (int) $row->id;
@@ -1553,7 +1625,8 @@ CREATE TABLE {$meta_table} (
 							ELSE 0
 						END
 					) AS sale_count
-				FROM ' . self::get_products_table_name() . " WHERE parent_id = %d AND type = %s AND status = %s AND price IS NOT NULL AND price <> ''", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				FROM %i WHERE parent_id = %d AND type = %s AND status = %s AND price IS NOT NULL AND price <> ""',
+				self::get_products_table_name(),
 				$parent_id,
 				ProductType::VARIATION,
 				ProductStatus::PUBLISH
@@ -1901,9 +1974,12 @@ CREATE TABLE {$meta_table} (
 		}
 
 		$attribute_ids = wp_list_pluck( $attribute_rows, 'id' );
+		$attribute_in  = implode( ',', array_map( 'absint', $attribute_ids ) );
 		$values_rows   = $wpdb->get_results(
 			$wpdb->prepare(
-				'SELECT * FROM ' . self::get_attribute_values_table_name() . " WHERE product_id = %d AND attribute_id IN ( " . implode( ',', array_map( 'absint', $attribute_ids ) ) . " ) AND scope = 'product' ORDER BY position ASC, id ASC", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $attribute_in is built from absint() casts, no user input.
+				"SELECT * FROM %i WHERE product_id = %d AND attribute_id IN ( {$attribute_in} ) AND scope = 'product' ORDER BY position ASC, id ASC",
+				self::get_attribute_values_table_name(),
 				$product_id
 			)
 		);
@@ -2106,7 +2182,8 @@ CREATE TABLE {$meta_table} (
 		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				'SELECT * FROM ' . self::get_downloads_table_name() . " WHERE product_id IN ({$placeholder}) ORDER BY product_id ASC, sort_order ASC, id ASC",
+				"SELECT * FROM %i WHERE product_id IN ({$placeholder}) ORDER BY product_id ASC, sort_order ASC, id ASC",
+				self::get_downloads_table_name(),
 				...$ids
 			)
 		);
@@ -2668,9 +2745,10 @@ CREATE TABLE {$meta_table} (
 	}
 
 	/**
-	 * Return a list of related products. Defers to the legacy CPT logic for
-	 * Phase 1 — the related-products query is taxonomy-driven and the term
-	 * tables are still authoritative under HPPS.
+	 * Return a list of related products. Mirrors {@see WC_Product_Data_Store_CPT::get_related_products()}
+	 * but widens the post-type filter to include `product_placeholder` so
+	 * HPPS-native products surface alongside migrated `product` rows on
+	 * single-product pages.
 	 *
 	 * @param array $cats_array  Category IDs.
 	 * @param array $tags_array  Tag IDs.
@@ -2680,8 +2758,83 @@ CREATE TABLE {$meta_table} (
 	 * @return array
 	 */
 	public function get_related_products( $cats_array, $tags_array, $exclude_ids, $limit, $product_id ) {
-		$store = new \WC_Product_Data_Store_CPT();
-		return $store->get_related_products( $cats_array, $tags_array, $exclude_ids, $limit, $product_id );
+		global $wpdb;
+
+		$args = array(
+			'categories'  => $cats_array,
+			'tags'        => $tags_array,
+			'exclude_ids' => $exclude_ids,
+			'limit'       => $limit + 10,
+		);
+
+		$related_product_query = (array) apply_filters(
+			'woocommerce_product_related_posts_query',
+			$this->get_related_products_query( $cats_array, $tags_array, $exclude_ids, $limit + 10 ),
+			$product_id,
+			$args
+		);
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+		return $wpdb->get_col( implode( ' ', $related_product_query ) );
+	}
+
+	/**
+	 * Build the related-products query parts. Diverges from {@see WC_Product_Data_Store_CPT::get_related_products_query()}
+	 * only in that the `post_type` filter accepts both `product` and
+	 * `product_placeholder`, so HPPS-native products participate in the
+	 * "you may also like" rail.
+	 *
+	 * @param array $cats_array  Category IDs.
+	 * @param array $tags_array  Tag IDs.
+	 * @param array $exclude_ids Excluded IDs.
+	 * @param int   $limit       Limit of results.
+	 * @return array{fields:string,join:string,where:string,limits:string}
+	 */
+	public function get_related_products_query( $cats_array, $tags_array, $exclude_ids, $limit ) {
+		global $wpdb;
+
+		$include_term_ids            = array_merge( $cats_array, $tags_array );
+		$exclude_term_ids            = array();
+		$product_visibility_term_ids = wc_get_product_visibility_term_ids();
+
+		if ( $product_visibility_term_ids['exclude-from-catalog'] ) {
+			$exclude_term_ids[] = $product_visibility_term_ids['exclude-from-catalog'];
+		}
+
+		if ( 'yes' === get_option( 'woocommerce_hide_out_of_stock_items' ) && $product_visibility_term_ids[ ProductStockStatus::OUT_OF_STOCK ] ) {
+			$exclude_term_ids[] = $product_visibility_term_ids[ ProductStockStatus::OUT_OF_STOCK ];
+		}
+
+		$query = array(
+			'fields' => "
+				SELECT DISTINCT ID FROM {$wpdb->posts} p
+			",
+			'join'   => '',
+			'where'  => "
+				WHERE 1=1
+				AND p.post_status = 'publish'
+				AND p.post_type IN ( 'product', '" . CustomProductsTableController::PLACEHOLDER_POST_TYPE . "' )
+
+			",
+			'limits' => '
+				LIMIT ' . absint( $limit ) . '
+			',
+		);
+
+		if ( count( $exclude_term_ids ) ) {
+			$query['join']  .= " LEFT JOIN ( SELECT object_id FROM {$wpdb->term_relationships} WHERE term_taxonomy_id IN ( " . implode( ',', array_map( 'absint', $exclude_term_ids ) ) . ' ) ) AS exclude_join ON exclude_join.object_id = p.ID';
+			$query['where'] .= ' AND exclude_join.object_id IS NULL';
+		}
+
+		if ( count( $include_term_ids ) ) {
+			$query['join'] .= " INNER JOIN ( SELECT object_id FROM {$wpdb->term_relationships} INNER JOIN {$wpdb->term_taxonomy} using( term_taxonomy_id ) WHERE term_id IN ( " . implode( ',', array_map( 'absint', $include_term_ids ) ) . ' ) ) AS include_join ON include_join.object_id = p.ID';
+		}
+
+		if ( count( $exclude_ids ) ) {
+			$query['where'] .= ' AND p.ID NOT IN ( ' . implode( ',', array_map( 'absint', $exclude_ids ) ) . ' )';
+		}
+
+		return $query;
 	}
 
 	/**
@@ -2710,7 +2863,8 @@ CREATE TABLE {$meta_table} (
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$wpdb->query(
 					$wpdb->prepare(
-						'UPDATE ' . self::get_products_table_name() . ' SET stock_quantity = COALESCE( stock_quantity, 0 ) + %f WHERE id = %d', // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+						'UPDATE %i SET stock_quantity = COALESCE( stock_quantity, 0 ) + %f WHERE id = %d',
+						self::get_products_table_name(),
 						$delta,
 						$product_id
 					)
@@ -2720,7 +2874,8 @@ CREATE TABLE {$meta_table} (
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$wpdb->query(
 					$wpdb->prepare(
-						'UPDATE ' . self::get_products_table_name() . ' SET stock_quantity = COALESCE( stock_quantity, 0 ) - %f WHERE id = %d', // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+						'UPDATE %i SET stock_quantity = COALESCE( stock_quantity, 0 ) - %f WHERE id = %d',
+						self::get_products_table_name(),
 						$delta,
 						$product_id
 					)
@@ -2730,7 +2885,8 @@ CREATE TABLE {$meta_table} (
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$wpdb->query(
 					$wpdb->prepare(
-						'UPDATE ' . self::get_products_table_name() . ' SET stock_quantity = %f WHERE id = %d', // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+						'UPDATE %i SET stock_quantity = %f WHERE id = %d',
+						self::get_products_table_name(),
 						$delta,
 						$product_id
 					)
@@ -2784,7 +2940,8 @@ CREATE TABLE {$meta_table} (
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$wpdb->query(
 					$wpdb->prepare(
-						'UPDATE ' . self::get_products_table_name() . ' SET total_sales = COALESCE( total_sales, 0 ) + %f WHERE id = %d', // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+						'UPDATE %i SET total_sales = COALESCE( total_sales, 0 ) + %f WHERE id = %d',
+						self::get_products_table_name(),
 						$qty,
 						$product_id
 					)
@@ -2794,7 +2951,8 @@ CREATE TABLE {$meta_table} (
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$wpdb->query(
 					$wpdb->prepare(
-						'UPDATE ' . self::get_products_table_name() . ' SET total_sales = GREATEST( COALESCE( total_sales, 0 ) - %f, 0 ) WHERE id = %d', // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+						'UPDATE %i SET total_sales = GREATEST( COALESCE( total_sales, 0 ) - %f, 0 ) WHERE id = %d',
+						self::get_products_table_name(),
 						$qty,
 						$product_id
 					)
@@ -2804,7 +2962,8 @@ CREATE TABLE {$meta_table} (
 				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 				$wpdb->query(
 					$wpdb->prepare(
-						'UPDATE ' . self::get_products_table_name() . ' SET total_sales = %f WHERE id = %d', // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+						'UPDATE %i SET total_sales = %f WHERE id = %d',
+						self::get_products_table_name(),
 						$qty,
 						$product_id
 					)
@@ -2953,7 +3112,8 @@ CREATE TABLE {$meta_table} (
 		global $wpdb;
 
 		return $wpdb->prepare(
-			'SELECT COALESCE( stock_quantity, 0 ) FROM ' . self::get_products_table_name() . ' WHERE id = %d', // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			'SELECT COALESCE( stock_quantity, 0 ) FROM %i WHERE id = %d',
+			self::get_products_table_name(),
 			(int) $product_id
 		);
 	}
@@ -3124,8 +3284,8 @@ CREATE TABLE {$meta_table} (
 		// product ID into the box and expect it to surface).
 		if ( is_numeric( $term ) ) {
 			$post_id   = absint( $term );
-			$row_type  = (string) $wpdb->get_var( $wpdb->prepare( "SELECT type FROM {$products_table} WHERE id = %d", $post_id ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-			$parent_id = (int) $wpdb->get_var( $wpdb->prepare( "SELECT parent_id FROM {$products_table} WHERE id = %d", $post_id ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$row_type  = (string) $wpdb->get_var( $wpdb->prepare( 'SELECT type FROM %i WHERE id = %d', $products_table, $post_id ) );
+			$parent_id = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT parent_id FROM %i WHERE id = %d', $products_table, $post_id ) );
 
 			if ( 'variation' === $row_type && $include_variations ) {
 				$ids[] = $post_id;

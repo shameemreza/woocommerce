@@ -53,6 +53,26 @@ class ProductDataSynchronizer {
 	public const PRODUCTS_TABLE_CREATED_OPTION = 'woocommerce_custom_product_tables_created';
 
 	/**
+	 * Stores the highest HPPS schema version that has been applied via
+	 * `dbDelta()` on this site. Compared against {@see SCHEMA_VERSION} on
+	 * boot — when the option is below the constant we re-run dbDelta so
+	 * column additions and index changes shipped after the tables were
+	 * first created actually land. Without this, an installation that
+	 * already has the tables would silently skip schema upgrades because
+	 * the existence check at {@see check_products_table_exists()} alone
+	 * can't see column drift.
+	 */
+	public const PRODUCTS_TABLE_SCHEMA_VERSION_OPTION = 'woocommerce_custom_product_tables_schema_version';
+
+	/**
+	 * Current HPPS schema version. Bump this whenever
+	 * {@see ProductsTableDataStore::get_database_schema()} grows a column,
+	 * an index, or a charset/collation change so existing installs pick
+	 * up the migration on the next boot.
+	 */
+	public const SCHEMA_VERSION = 1;
+
+	/**
 	 * When `'yes'`, the {@see ProductDataSyncListener} mirrors third-party
 	 * postmeta writes back into the matching `wc_products` columns. Mirrors
 	 * the role HPOS' `woocommerce_custom_orders_table_data_sync_enabled`
@@ -163,13 +183,20 @@ class ProductDataSynchronizer {
 	 * Run dbDelta to create any missing HPPS tables. Logs an error if some
 	 * tables remain missing afterwards.
 	 *
+	 * Idempotent: dbDelta() compares the supplied schema with the live
+	 * tables and only issues the DDL needed to converge. We bump the
+	 * schema-version option once the tables are confirmed present so a
+	 * future {@see check_schema_is_current()} call can short-circuit.
+	 *
 	 * @return bool True when all tables exist after the call, false otherwise.
 	 */
 	public function create_database_tables(): bool {
 		$this->database_util->dbdelta( $this->data_store->get_database_schema() );
 
 		$success = $this->check_products_table_exists();
-		if ( ! $success ) {
+		if ( $success ) {
+			update_option( self::PRODUCTS_TABLE_SCHEMA_VERSION_OPTION, (string) self::SCHEMA_VERSION );
+		} else {
 			$missing = $this->database_util->get_missing_tables( $this->data_store->get_database_schema() );
 			wc_get_logger()->error(
 				'HPPS tables are missing in the database and could not be created. Missing tables: ' . implode( ', ', $missing ),
@@ -177,6 +204,19 @@ class ProductDataSynchronizer {
 			);
 		}
 		return $success;
+	}
+
+	/**
+	 * Whether the on-disk HPPS schema is at the version this build expects.
+	 *
+	 * Cheap option read; returns false when the option is missing (legacy
+	 * installs created before schema-versioning shipped) so the bootstrap
+	 * path re-runs dbDelta and brings them up to {@see SCHEMA_VERSION}.
+	 *
+	 * @return bool
+	 */
+	public function check_schema_is_current(): bool {
+		return (int) get_option( self::PRODUCTS_TABLE_SCHEMA_VERSION_OPTION, 0 ) >= self::SCHEMA_VERSION;
 	}
 
 	/**
@@ -189,6 +229,7 @@ class ProductDataSynchronizer {
 			$this->database_util->drop_database_table( $table );
 		}
 		delete_option( self::PRODUCTS_TABLE_CREATED_OPTION );
+		delete_option( self::PRODUCTS_TABLE_SCHEMA_VERSION_OPTION );
 	}
 
 	/**
