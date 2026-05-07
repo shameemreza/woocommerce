@@ -12,6 +12,7 @@ namespace Automattic\WooCommerce\Internal\DataStores\Products;
 use Automattic\WooCommerce\Enums\FeaturePluginCompatibility;
 use Automattic\WooCommerce\Internal\Features\FeaturesController;
 use Automattic\WooCommerce\Utilities\PluginUtil;
+use WC_Admin_Settings;
 
 defined( 'ABSPATH' ) || exit;
 
@@ -51,6 +52,17 @@ class CustomProductsTableController {
 	 * without firing `save_post_product` and other CPT hooks.
 	 */
 	public const PLACEHOLDER_POST_TYPE = 'product_placeholder';
+
+	/**
+	 * Query arg used by the "Sync products now" link on the Features page
+	 * and on the admin notice. Mirrors the HPOS `wc_hpos_sync_now` arg.
+	 */
+	private const SYNC_QUERY_ARG = 'wc_hpps_sync_now';
+
+	/**
+	 * Query arg used by the "Stop sync" link.
+	 */
+	private const STOP_SYNC_QUERY_ARG = 'wc_hpps_stop_sync';
 
 	/**
 	 * Features controller dependency.
@@ -166,6 +178,13 @@ class CustomProductsTableController {
 		// only when the value actually changes, so a no-op save is free.
 		add_action( 'add_option_' . self::CUSTOM_PRODUCT_TABLES_USAGE_ENABLED_OPTION, array( $this, 'on_feature_option_added' ), 10, 2 );
 		add_action( 'update_option_' . self::CUSTOM_PRODUCT_TABLES_USAGE_ENABLED_OPTION, array( $this, 'on_feature_option_updated' ), 10, 2 );
+
+		// Admin UX: banner on every admin screen + Tools page entries +
+		// Features-page "Sync now / Stop sync" handler.
+		add_action( 'admin_notices', array( $this, 'render_pending_sync_notice' ) );
+		add_action( 'woocommerce_sections_advanced', array( $this, 'handle_sync_now_action' ) );
+		add_filter( 'woocommerce_debug_tools', array( $this, 'add_hpps_tools' ), 999 );
+		add_filter( 'removable_query_args', array( $this, 'register_removable_query_args' ) );
 	}
 
 	/**
@@ -249,6 +268,208 @@ class CustomProductsTableController {
 		}
 		$attempted = true;
 		$this->ensure_tables_and_enqueue_migration();
+	}
+
+	/*
+	|--------------------------------------------------------------------------
+	| Admin UX: pending-migration banner, sync handler, Tools page entries.
+	|--------------------------------------------------------------------------
+	*/
+
+	/**
+	 * Render a non-dismissable yellow banner on every admin screen while the
+	 * feature is on and there are still products to copy across to HPPS.
+	 *
+	 * The banner mirrors the HPOS pending-sync notice. It appears on every
+	 * `wp-admin` page (not just WC pages) so an operator can't miss the fact
+	 * that a migration is in flight.
+	 *
+	 * @internal
+	 *
+	 * @return void
+	 */
+	public function render_pending_sync_notice(): void {
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			return;
+		}
+		if ( ! $this->custom_product_tables_usage_is_enabled() ) {
+			return;
+		}
+		if ( ! $this->data_synchronizer->get_table_exists() ) {
+			return;
+		}
+
+		$pending = $this->data_synchronizer->get_pending_count();
+		if ( $pending <= 0 ) {
+			return;
+		}
+
+		$features_page_url = $this->features_controller->get_features_page_url();
+		$sync_now_url      = wp_nonce_url(
+			add_query_arg( array( self::SYNC_QUERY_ARG => 'true' ), $features_page_url ),
+			'hpps-sync-now'
+		);
+
+		?>
+		<div class="notice notice-warning">
+			<p>
+				<strong><?php esc_html_e( 'High-performance product storage', 'woocommerce' ); ?></strong>
+				—
+				<?php
+				echo esc_html(
+					sprintf(
+						/* translators: %s is a count of products waiting to be migrated. */
+						_n(
+							'%s product still needs to be copied into the HPPS tables before storage is fully migrated.',
+							'%s products still need to be copied into the HPPS tables before storage is fully migrated.',
+							$pending,
+							'woocommerce'
+						),
+						number_format_i18n( $pending )
+					)
+				);
+				?>
+				<a class="button button-primary" style="margin-left: 8px;" href="<?php echo esc_url( $sync_now_url ); ?>">
+					<?php esc_html_e( 'Sync products now', 'woocommerce' ); ?>
+				</a>
+			</p>
+		</div>
+		<?php
+	}
+
+	/**
+	 * Handle the `wc_hpps_sync_now` and `wc_hpps_stop_sync` query args fired
+	 * from the Features-page link or the admin notice. Verifies the nonce,
+	 * then either kicks off the background processor or removes it.
+	 *
+	 * Hooked to `woocommerce_sections_advanced` (same as HPOS) so the action
+	 * runs while the user is still on the Settings → Advanced screen and
+	 * `WC_Admin_Settings::add_*` messages render at the top of the page.
+	 *
+	 * @internal
+	 *
+	 * @return void
+	 */
+	public function handle_sync_now_action(): void {
+		$section = filter_input( INPUT_GET, 'section' );
+		if ( 'features' !== $section ) {
+			return;
+		}
+
+		if ( filter_input( INPUT_GET, self::SYNC_QUERY_ARG, FILTER_VALIDATE_BOOLEAN ) ) {
+			$action = 'sync-now';
+		} elseif ( filter_input( INPUT_GET, self::STOP_SYNC_QUERY_ARG, FILTER_VALIDATE_BOOLEAN ) ) {
+			$action = 'stop-sync';
+		} else {
+			return;
+		}
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- handled below.
+		$nonce = isset( $_GET['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_GET['_wpnonce'] ) ) : '';
+		if ( ! wp_verify_nonce( $nonce, "hpps-{$action}" ) ) {
+			WC_Admin_Settings::add_error(
+				'sync-now' === $action
+					? __( 'Unable to start product sync. The link you followed may have expired.', 'woocommerce' )
+					: __( 'Unable to stop product sync. The link you followed may have expired.', 'woocommerce' )
+			);
+			return;
+		}
+
+		if ( 'sync-now' === $action ) {
+			if ( ! $this->data_synchronizer->check_products_table_exists() && ! $this->data_synchronizer->create_database_tables() ) {
+				WC_Admin_Settings::add_error( __( 'Unable to create the HPPS tables for sync. Check the WooCommerce logs for details.', 'woocommerce' ) );
+				return;
+			}
+
+			$this->data_synchronizer->enqueue_background_migration();
+			WC_Admin_Settings::add_message( __( 'Product sync to HPPS has been queued. It will run in the background via Action Scheduler.', 'woocommerce' ) );
+			return;
+		}
+
+		$this->data_synchronizer->dequeue_background_migration();
+		WC_Admin_Settings::add_message( __( 'Product sync to HPPS has been stopped.', 'woocommerce' ) );
+	}
+
+	/**
+	 * Strip the sync query args from the URL after the action runs so that a
+	 * page refresh doesn't replay the request.
+	 *
+	 * @internal
+	 *
+	 * @param array $query_args The query args WP considers removable.
+	 * @return array
+	 */
+	public function register_removable_query_args( array $query_args ): array {
+		$query_args[] = self::SYNC_QUERY_ARG;
+		$query_args[] = self::STOP_SYNC_QUERY_ARG;
+		return $query_args;
+	}
+
+	/**
+	 * Add HPPS entries to WooCommerce → Status → Tools.
+	 *
+	 * Two tools:
+	 *  - "Sync products to HPPS" — kicks the migration synchronously (small
+	 *    batch) so an operator can move work along without waiting for the
+	 *    Action Scheduler tick.
+	 *  - "Delete the HPPS tables" — destructive, only enabled when the
+	 *    feature is off and no migration is queued. Mirrors HPOS exactly.
+	 *
+	 * @internal
+	 *
+	 * @param array $tools_array Array of tools as built by core.
+	 * @return array
+	 */
+	public function add_hpps_tools( array $tools_array ): array {
+		$tools_array['sync_products_to_hpps'] = array(
+			'name'             => __( 'Sync products to HPPS', 'woocommerce' ),
+			'desc'             => __( 'Copy any products that are still in wp_posts/wp_postmeta into the HPPS tables. Safe to run repeatedly — already-migrated products are skipped.', 'woocommerce' ),
+			'requires_refresh' => true,
+			'callback'         => function () {
+				if ( ! $this->custom_product_tables_usage_is_enabled() ) {
+					/* translators: %s is the path to the Features settings page. */
+					return sprintf( __( 'HPPS is not enabled. Turn it on under %s before running this tool.', 'woocommerce' ), 'WooCommerce → Settings → Advanced → Features' );
+				}
+				if ( ! $this->data_synchronizer->check_products_table_exists() && ! $this->data_synchronizer->create_database_tables() ) {
+					return __( 'Unable to create the HPPS tables. Check the WooCommerce logs for details.', 'woocommerce' );
+				}
+
+				$summary = $this->data_synchronizer->run_synchronously( 50, 20 );
+				return sprintf(
+					/* translators: 1: products migrated; 2: products skipped; 3: errors; 4: iterations. */
+					__( 'Sync completed: %1$d migrated, %2$d skipped, %3$d errors across %4$d iterations.', 'woocommerce' ),
+					(int) $summary['migrated'],
+					(int) $summary['skipped'],
+					(int) $summary['errors'],
+					(int) $summary['iterations']
+				);
+			},
+			'button'           => __( 'Sync', 'woocommerce' ),
+		);
+
+		$can_delete = ! $this->custom_product_tables_usage_is_enabled();
+		$tools_array['delete_hpps_tables'] = array(
+			'name'             => __( 'Delete the HPPS tables', 'woocommerce' ),
+			'desc'             => sprintf(
+				'<strong class="red">%1$s</strong> %2$s',
+				__( 'Note:', 'woocommerce' ),
+				$can_delete
+					? __( 'Drop every HPPS table. To recreate them, re-enable HPPS under Settings → Advanced → Features.', 'woocommerce' )
+					: __( 'HPPS tables can only be deleted when the feature is turned off (Settings → Advanced → Features).', 'woocommerce' )
+			),
+			'requires_refresh' => true,
+			'callback'         => function () use ( $can_delete ) {
+				if ( ! $can_delete ) {
+					return __( 'HPPS is currently enabled — cannot delete its tables.', 'woocommerce' );
+				}
+				$this->data_synchronizer->delete_database_tables();
+				return __( 'HPPS tables have been deleted.', 'woocommerce' );
+			},
+			'button'           => __( 'Delete', 'woocommerce' ),
+			'disabled'         => ! $can_delete,
+		);
+
+		return $tools_array;
 	}
 
 	/**
@@ -377,6 +598,69 @@ class CustomProductsTableController {
 	}
 
 	/**
+	 * Build the inline status string that appears under the HPPS radio on
+	 * the Features page. Returns an empty string when no status applies
+	 * (feature off and tables absent).
+	 *
+	 * Three states are reported:
+	 *  - Migration finished cleanly.
+	 *  - Migration in progress (with a "Stop sync" link).
+	 *  - Migration pending (with a "Sync now" link).
+	 *
+	 * @return string HTML-safe status string, or empty.
+	 */
+	private function build_sync_status_description(): string {
+		if ( ! isset( $this->data_synchronizer ) ) {
+			return '';
+		}
+		if ( ! $this->data_synchronizer->get_table_exists() ) {
+			return '';
+		}
+
+		$pending = $this->data_synchronizer->get_pending_count();
+		if ( $pending <= 0 ) {
+			return esc_html__( 'All products are synchronised with the HPPS tables.', 'woocommerce' );
+		}
+
+		$features_page_url = $this->features_controller->get_features_page_url();
+		$sync_now_url      = wp_nonce_url(
+			add_query_arg( array( self::SYNC_QUERY_ARG => 'true' ), $features_page_url ),
+			'hpps-sync-now'
+		);
+		$stop_sync_url     = wp_nonce_url(
+			add_query_arg( array( self::STOP_SYNC_QUERY_ARG => 'true' ), $features_page_url ),
+			'hpps-stop-sync'
+		);
+
+		$lines = array();
+		if ( $this->data_synchronizer->is_background_migration_enqueued() ) {
+			$lines[] = sprintf(
+				/* translators: %s: pending product count. */
+				esc_html__( 'Currently syncing products to HPPS. %s pending.', 'woocommerce' ),
+				esc_html( number_format_i18n( $pending ) )
+			);
+			$lines[] = sprintf(
+				'<a href="%1$s" class="button-link">%2$s</a>',
+				esc_url( $stop_sync_url ),
+				esc_html__( 'Stop sync', 'woocommerce' )
+			);
+		} else {
+			$lines[] = sprintf(
+				/* translators: %s: pending product count. */
+				esc_html__( '%s products still need to be migrated to the HPPS tables.', 'woocommerce' ),
+				esc_html( number_format_i18n( $pending ) )
+			);
+			$lines[] = sprintf(
+				'<a href="%1$s" class="button-link">%2$s</a>',
+				esc_url( $sync_now_url ),
+				esc_html__( 'Sync products now', 'woocommerce' )
+			);
+		}
+
+		return implode( ' ', $lines );
+	}
+
+	/**
 	 * Build the radio-button setting block displayed under
 	 * WooCommerce > Settings > Advanced > Features.
 	 *
@@ -396,7 +680,16 @@ class CustomProductsTableController {
 		// pattern.
 		$get_desc = function () {
 			$plugin_compatibility = $this->features_controller->get_compatible_plugins_for_feature( self::FEATURE_ID, true );
-			return $this->plugin_util->generate_incompatible_plugin_feature_warning( self::FEATURE_ID, $plugin_compatibility );
+			$warning              = $this->plugin_util->generate_incompatible_plugin_feature_warning( self::FEATURE_ID, $plugin_compatibility );
+
+			$status = $this->build_sync_status_description();
+			if ( '' === $status ) {
+				return $warning;
+			}
+			if ( '' === $warning ) {
+				return $status;
+			}
+			return $warning . '<br />' . $status;
 		};
 
 		$get_disabled = function () {
