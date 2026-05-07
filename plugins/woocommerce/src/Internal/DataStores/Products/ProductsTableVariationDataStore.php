@@ -195,20 +195,46 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 
 		$this->load_parent_data( $product );
 
-		// Generated title may have drifted since last save. Repair lazily so
-		// listings show the current parent name; persist to wc_products only
-		// when it differs from the stored value.
+		// Generated title may have drifted since last save (e.g. the parent
+		// product was renamed). Repair lazily so listings show the current
+		// parent name; persist to wc_products only when it differs from the
+		// stored value.
 		$new_title = $this->generate_product_title( $product );
 		if ( $row->name !== $new_title ) {
 			$product->set_name( $new_title );
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->update(
-				self::get_products_table_name(),
-				array( 'name' => $new_title ),
-				array( 'id' => $product_id ),
-				array( '%s' ),
-				array( '%d' )
-			);
+
+			// Mirror to the `product_placeholder` post and clear product
+			// caches so anything that already read the stale title from
+			// `get_post()` or transient caches (admin lists, REST, the
+			// variations dropdown) picks up the corrected version on the
+			// next request. Bracket the writes with `start_internal_write`
+			// so the postmeta listener doesn't try to bounce the change
+			// back into the same row.
+			ProductDataSyncListener::start_internal_write();
+			try {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->update(
+					self::get_products_table_name(),
+					array( 'name' => $new_title ),
+					array( 'id' => $product_id ),
+					array( '%s' ),
+					array( '%d' )
+				);
+
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->update(
+					$wpdb->posts,
+					array( 'post_title' => $new_title ),
+					array( 'ID' => $product_id ),
+					array( '%s' ),
+					array( '%d' )
+				);
+				clean_post_cache( $product_id );
+			} finally {
+				ProductDataSyncListener::end_internal_write();
+			}
+
+			$this->clear_caches( $product );
 		}
 
 		$product->set_object_read( true );
@@ -277,8 +303,9 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 			);
 		}
 
-		// Sync the placeholder post title/excerpt for compatibility with
-		// the few wp_posts queries (e.g. autosuggest) that still hit it.
+		// Sync the placeholder post title/excerpt/mtime for compatibility
+		// with the few wp_posts queries (e.g. autosuggest, post-meta-keyed
+		// caches) that still hit it.
 		//
 		// post_parent is conditional: `read()` defensively sets the
 		// in-memory parent_id to 0 when the parent doesn't currently look
@@ -287,13 +314,21 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 		// `wp_posts.post_parent` permanently orphans the placeholder and
 		// breaks untrash/recovery — so we only persist `post_parent` when
 		// the in-memory value is >0 or the caller explicitly changed it.
+		//
+		// post_modified* always tracks `wc_products.date_modified_gmt` so
+		// `get_post_modified_time()` keeps reporting the canonical mtime.
+		$now_gmt   = $data['date_modified_gmt'];
+		$now_local = get_date_from_gmt( $now_gmt );
+
 		$post_data    = array(
-			'post_title'   => (string) $product->get_name(),
-			'post_excerpt' => (string) $product->get_attribute_summary( 'edit' ),
-			'menu_order'   => (int) $product->get_menu_order(),
-			'post_status'  => $product->get_status() ? $product->get_status() : ProductStatus::PUBLISH,
+			'post_title'        => (string) $product->get_name(),
+			'post_excerpt'      => (string) $product->get_attribute_summary( 'edit' ),
+			'menu_order'        => (int) $product->get_menu_order(),
+			'post_status'       => $product->get_status() ? $product->get_status() : ProductStatus::PUBLISH,
+			'post_modified'     => $now_local,
+			'post_modified_gmt' => $now_gmt,
 		);
-		$post_formats = array( '%s', '%s', '%d', '%s' );
+		$post_formats = array( '%s', '%s', '%d', '%s', '%s', '%s' );
 
 		$new_parent = (int) $product->get_parent_id();
 		if ( $new_parent > 0 || array_key_exists( 'parent_id', $changes ) ) {

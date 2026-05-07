@@ -650,8 +650,14 @@ CREATE TABLE {$meta_table} (
 			case 'bool':
 				return wc_bool_to_string( $value ) === 'yes' ? 1 : 0;
 			case 'date':
+				// Legacy CPT writes `_sale_price_dates_*` as `$value->getTimestamp()`
+				// (UTC unix). The DATETIME column needs the same UTC representation
+				// so `wc_string_to_timestamp()` (which treats unqualified strings as
+				// UTC) round-trips back to the original instant. Using
+				// `getOffsetTimestamp()` here would silently shift the value by
+				// the site offset on every write/read cycle.
 				if ( $value instanceof \WC_DateTime ) {
-					return gmdate( 'Y-m-d H:i:s', $value->getOffsetTimestamp() );
+					return gmdate( 'Y-m-d H:i:s', $value->getTimestamp() );
 				}
 				if ( is_numeric( $value ) ) {
 					return gmdate( 'Y-m-d H:i:s', (int) $value );
@@ -897,15 +903,19 @@ CREATE TABLE {$meta_table} (
 		}
 
 		// Keep the placeholder post in step with the product. We mirror:
-		//   * `post_title`  on a name change (so admin previews and the
-		//                   placeholder permalink lookups still surface a
-		//                   sensible label);
-		//   * `post_status` on a status change (so any code path that uses
-		//                   `get_post_status()` — REST endpoints, third-party
-		//                   plugins, the trash bin UI — stays in sync with
-		//                   the canonical `wc_products.status`).
+		//   * `post_title`        on a name change (so admin previews and the
+		//                         placeholder permalink lookups still surface
+		//                         a sensible label);
+		//   * `post_status`       on a status change (so any code path that
+		//                         uses `get_post_status()` — REST endpoints,
+		//                         third-party plugins, the trash bin UI —
+		//                         stays in sync with `wc_products.status`);
+		//   * `post_modified*`    on every update (so `get_post_modified_time()`
+		//                         and any plugin keying off the placeholder
+		//                         row's mtime mirrors the canonical
+		//                         `wc_products.date_modified_gmt`).
 		// We accumulate the dirty columns and issue a single UPDATE so we
-		// don't pay for two round-trips when both change.
+		// don't pay for multiple round-trips when several change at once.
 		$post_data    = array();
 		$post_formats = array();
 		if ( array_key_exists( 'name', $changes ) ) {
@@ -920,17 +930,24 @@ CREATE TABLE {$meta_table} (
 			$post_data['post_status'] = $new_status;
 			$post_formats[]           = '%s';
 		}
-		if ( ! empty( $post_data ) ) {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->update(
-				$wpdb->posts,
-				$post_data,
-				array( 'ID' => (int) $product->get_id() ),
-				$post_formats,
-				array( '%d' )
-			);
-			clean_post_cache( $product->get_id() );
-		}
+
+		$now_gmt   = $data['date_modified_gmt'];
+		$now_local = get_date_from_gmt( $now_gmt );
+
+		$post_data['post_modified']     = $now_local;
+		$post_data['post_modified_gmt'] = $now_gmt;
+		$post_formats[]                 = '%s';
+		$post_formats[]                 = '%s';
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->update(
+			$wpdb->posts,
+			$post_data,
+			array( 'ID' => (int) $product->get_id() ),
+			$post_formats,
+			array( '%d' )
+		);
+		clean_post_cache( $product->get_id() );
 
 		if ( array_key_exists( 'attributes', $changes ) || array_key_exists( 'default_attributes', $changes ) ) {
 			$this->persist_attributes( $product );

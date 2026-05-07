@@ -138,6 +138,14 @@ class PostToProductTableMigrator {
 
 		$logger = wc_get_logger();
 
+		// `migrate_single_product()` relies on a START TRANSACTION /
+		// COMMIT / ROLLBACK envelope so a partial multi-table write can
+		// never land. That's a no-op on non-transactional engines
+		// (MyISAM, Aria), where a mid-batch failure would silently leave
+		// the HPPS tables half-populated. Warn loudly once per request so
+		// site owners can fix their DB before they migrate at scale.
+		$this->maybe_warn_non_innodb_engine( $logger );
+
 		foreach ( $product_ids as $product_id ) {
 			$product_id = (int) $product_id;
 			if ( $product_id <= 0 ) {
@@ -241,6 +249,61 @@ class PostToProductTableMigrator {
 		 * @param string $type       Detected product type.
 		 */
 		do_action( 'woocommerce_product_migrated_to_hpps', $product_id, $type );
+	}
+
+	/**
+	 * Log a one-shot warning when `wc_products` is not on a transactional
+	 * engine, because the migrator's transaction envelope silently no-ops
+	 * on MyISAM/Aria and a partial multi-table failure could leave the
+	 * HPPS side inconsistent.
+	 *
+	 * Run once per request (static guard) so a 1 000-product batch doesn't
+	 * spam the log. Failures inside the engine probe are swallowed: this
+	 * is purely advisory and shouldn't break a migration if
+	 * `information_schema` is unavailable.
+	 *
+	 * @param \WC_Logger_Interface $logger Active logger.
+	 * @return void
+	 */
+	private function maybe_warn_non_innodb_engine( $logger ): void {
+		static $warned = false;
+		if ( $warned ) {
+			return;
+		}
+		$warned = true;
+
+		global $wpdb;
+
+		$products_table = ProductsTableDataStore::get_products_table_name();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$engine = $wpdb->get_var(
+			$wpdb->prepare(
+				'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s LIMIT 1',
+				DB_NAME,
+				$products_table
+			)
+		);
+
+		// Empty/null result probably just means the user lacks
+		// `information_schema` access (shared hosting). Stay silent.
+		if ( ! is_string( $engine ) || '' === $engine ) {
+			return;
+		}
+
+		if ( 0 === strcasecmp( $engine, 'InnoDB' ) ) {
+			return;
+		}
+
+		$logger->warning(
+			sprintf(
+				/* translators: 1: products table name, 2: detected storage engine. */
+				__( 'HPPS migration: %1$s is using the %2$s storage engine. Transactions are a no-op on non-InnoDB engines, so a mid-batch failure may leave the HPPS tables half-populated. Convert the table to InnoDB before running a full migration.', 'woocommerce' ),
+				$products_table,
+				$engine
+			),
+			array( 'source' => self::LOGS_SOURCE_NAME )
+		);
 	}
 
 	/**

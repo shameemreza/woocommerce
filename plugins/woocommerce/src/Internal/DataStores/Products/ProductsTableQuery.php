@@ -360,11 +360,13 @@ class ProductsTableQuery {
 		$this->build_taxonomy_filters( $where_parts, $where_args );
 
 		$where_sql = empty( $where_parts ) ? '1=1' : implode( ' AND ', $where_parts );
-		$join_sql  = empty( $joins ) ? '' : ' ' . implode( ' ', $joins );
 
 		// Always include all rows by default; status defaulting is the
 		// caller's responsibility (WC_Product_Query supplies a default).
-		$order_sql = $this->build_order_sql();
+		// `build_order_sql` may push joins (e.g. `wc_product_meta_lookup`
+		// for price ordering); collect them before assembling $join_sql.
+		$order_sql = $this->build_order_sql( $joins );
+		$join_sql  = empty( $joins ) ? '' : ' ' . implode( ' ', $joins );
 		$limit_sql = $limit > 0 ? $wpdb->prepare( ' LIMIT %d, %d', $offset, $limit ) : '';
 
 		$id_sql = "SELECT p.id FROM {$this->table_name} AS p{$join_sql} WHERE {$where_sql}{$order_sql}{$limit_sql}";
@@ -609,7 +611,12 @@ class ProductsTableQuery {
 			return;
 		}
 
-		$joins[]       = "INNER JOIN {$wpdb->posts} AS posts ON posts.ID = p.id";
+		// Constrain the join to product-shaped post types so a foreign post
+		// id that happens to collide with a wc_products.id never satisfies
+		// the predicate. (`product_placeholder` is HPPS's non-public CPT;
+		// `product` is the legacy/migrated row; `product_variation` is the
+		// child variation post.)
+		$joins[]       = "INNER JOIN {$wpdb->posts} AS posts ON posts.ID = p.id AND posts.post_type IN ('product','product_placeholder','product_variation')";
 		$where_parts[] = '( p.name = %s OR posts.post_title = %s )';
 		$where_args[]  = (string) $name;
 		$where_args[]  = (string) $name;
@@ -718,7 +725,9 @@ class ProductsTableQuery {
 	 *
 	 * @return string SQL fragment, with leading space.
 	 */
-	private function build_order_sql(): string {
+	private function build_order_sql( array &$joins = array() ): string {
+		global $wpdb;
+
 		$order = strtoupper( (string) ( $this->query_vars['order'] ?? 'DESC' ) );
 		$order = ( 'ASC' === $order || 'DESC' === $order ) ? $order : 'DESC';
 
@@ -746,6 +755,21 @@ class ProductsTableQuery {
 			// won't reach this method because they'll have unsupported
 			// args that route through the CPT fallback.
 			return ' ORDER BY p.id ' . $order;
+		}
+
+		// Variable parents don't carry their own price in `wc_products.price`
+		// (the column is empty; the min/max live on the variations and are
+		// aggregated into `wc_product_meta_lookup`). Sorting by `p.price`
+		// would scatter all variable products to the bottom (or top) of the
+		// list with NULL prices. Route price/sale_price/regular_price ordering
+		// through the lookup table so variable parents get a sensible value
+		// alongside simple/external products. `COALESCE` falls back to the
+		// row column for HPPS rows that don't yet have a lookup entry
+		// (e.g. mid-migration), preserving the previous behaviour.
+		if ( in_array( $orderby, array( 'price', 'sale_price', 'regular_price' ), true ) ) {
+			$joins[] = "LEFT JOIN {$wpdb->wc_product_meta_lookup} AS lookup ON lookup.product_id = p.id";
+			$lookup_column = ( 'sale_price' === $orderby || 'regular_price' === $orderby ) ? $orderby : ( 'ASC' === $order ? 'min_price' : 'max_price' );
+			return " ORDER BY COALESCE( lookup.{$lookup_column}, p.{$column} ) {$order}";
 		}
 
 		return " ORDER BY p.{$column} {$order}";

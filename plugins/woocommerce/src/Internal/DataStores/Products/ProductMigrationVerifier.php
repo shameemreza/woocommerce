@@ -156,20 +156,18 @@ class ProductMigrationVerifier {
 	private function fetch_hpps_product_ids( int $limit ): array {
 		global $wpdb;
 
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name comes from a constant getter.
 		$products_table = ProductsTableDataStore::get_products_table_name();
 
 		if ( $limit > 0 ) {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$rows = $wpdb->get_col(
-				$wpdb->prepare(
-					"SELECT id FROM {$products_table} ORDER BY id ASC LIMIT %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-					$limit
-				)
+				$wpdb->prepare( 'SELECT id FROM %i ORDER BY id ASC LIMIT %d', $products_table, $limit )
 			);
 		} else {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-			$rows = $wpdb->get_col( "SELECT id FROM {$products_table} ORDER BY id ASC" );
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$rows = $wpdb->get_col(
+				$wpdb->prepare( 'SELECT id FROM %i ORDER BY id ASC', $products_table )
+			);
 		}
 
 		return array_map( 'intval', (array) $rows );
@@ -184,19 +182,20 @@ class ProductMigrationVerifier {
 	private function get_row_counts(): array {
 		global $wpdb;
 
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name comes from a constant getter.
 		$products_table = ProductsTableDataStore::get_products_table_name();
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$counts = $wpdb->get_row(
 			$wpdb->prepare(
-				"SELECT
-					( SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type IN ( %s, %s ) AND post_status NOT IN ( %s, %s ) ) AS posts,
-					( SELECT COUNT(*) FROM {$products_table} ) AS hpps", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				'SELECT
+					( SELECT COUNT(*) FROM %i WHERE post_type IN ( %s, %s ) AND post_status NOT IN ( %s, %s ) ) AS posts,
+					( SELECT COUNT(*) FROM %i ) AS hpps',
+				$wpdb->posts,
 				'product',
 				'product_variation',
 				'auto-draft',
-				'inherit'
+				'inherit',
+				$products_table
 			)
 		);
 
@@ -343,14 +342,10 @@ class ProductMigrationVerifier {
 		global $wpdb;
 
 		if ( 'hpps' === $side ) {
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name comes from a constant getter.
 			$products_table = ProductsTableDataStore::get_products_table_name();
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$type = $wpdb->get_var(
-				$wpdb->prepare(
-					"SELECT type FROM {$products_table} WHERE id = %d LIMIT 1", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-					$product_id
-				)
+				$wpdb->prepare( 'SELECT type FROM %i WHERE id = %d LIMIT 1', $products_table, $product_id )
 			);
 			return is_string( $type ) ? $type : '';
 		}
@@ -386,6 +381,17 @@ class ProductMigrationVerifier {
 	 * compare equal. Primarily handles arrays whose key order or nested
 	 * datetime objects would otherwise produce false positives.
 	 *
+	 * Also smooths out two harmless mismatches that the legacy CPT path and
+	 * HPPS path occasionally surface differently:
+	 *
+	 * - `null` vs `''`: `WC_Data` setters coerce missing meta to an empty
+	 *   string, but a few HPPS read paths return `null` for the same
+	 *   condition. Both should be considered "unset".
+	 * - Numeric formatting: `'10'`, `'10.0'`, `'10.00'`, and `10` all mean
+	 *   the same price/weight/dimension. Cast numeric scalars through
+	 *   `(float)` and back to a string so the comparison ignores trailing
+	 *   zeros and integer-vs-float differences.
+	 *
 	 * @param mixed $value Raw property value.
 	 * @return mixed
 	 */
@@ -403,6 +409,17 @@ class ProductMigrationVerifier {
 		}
 		if ( is_object( $value ) ) {
 			return wp_json_encode( $value );
+		}
+		if ( null === $value ) {
+			return '';
+		}
+		// Booleans must stay distinct from numeric `0`/`1`; only reshape
+		// genuine numeric scalars (price, weight, dimensions, counts).
+		if ( is_bool( $value ) ) {
+			return $value;
+		}
+		if ( is_numeric( $value ) ) {
+			return (string) (float) $value;
 		}
 		return $value;
 	}

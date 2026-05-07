@@ -493,6 +493,11 @@ class ProductsTableVariableDataStore extends ProductsTableDataStore implements W
 			return array();
 		}
 
+		// Match `WC_Product_Variable_Data_Store_CPT::read_children()` semantics
+		// — the variations dropdown should only consider variations that
+		// `read_children()` would include in its `all` set: anything in
+		// `publish` or `private`. Trashed, auto-draft, and pending variations
+		// must not contribute their attribute values to the parent's dropdown.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
@@ -502,12 +507,14 @@ class ProductsTableVariableDataStore extends ProductsTableDataStore implements W
 				WHERE av.scope = %s
 				AND a.product_id = %d
 				AND av.product_id IN (
-					SELECT id FROM ' . self::get_products_table_name() . ' WHERE parent_id = %d AND type = %s
+					SELECT id FROM ' . self::get_products_table_name() . ' WHERE parent_id = %d AND type = %s AND status IN ( %s, %s )
 				)', // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 				'variation',
 				$product_id,
 				$product_id,
-				ProductType::VARIATION
+				ProductType::VARIATION,
+				ProductStatus::PUBLISH,
+				ProductStatus::PRIVATE
 			)
 		);
 
