@@ -327,6 +327,29 @@ class ProductDataSyncListenerTests extends HppsTestCase {
 	}
 
 	/**
+	 * @testdox C1 — updating the unprefixed `total_sales` postmeta mirrors into wc_products.total_sales.
+	 *
+	 * Round-1 fix: META_TO_COLUMN_MAP keyed `_total_sales` (with the
+	 * common-prefix convention) instead of the actual postmeta key
+	 * `total_sales`. Result: WC core's order completion path that bumps
+	 * the meta key was never mirrored into the column store, so HPPS
+	 * underreported sales counts. The map fix was a one-character change,
+	 * which makes a regression trivially easy to ship — the test guards
+	 * against it.
+	 */
+	public function test_total_sales_postmeta_mirrors_into_wc_products_column(): void {
+		$product_id = $this->create_migrated_simple_product();
+
+		update_post_meta( $product_id, 'total_sales', 42 );
+
+		$this->assertSame(
+			'42',
+			$this->read_column( $product_id, 'total_sales' ),
+			'C1: postmeta key `total_sales` (no underscore prefix) must mirror into wc_products.total_sales. A regression to `_total_sales` would leave the column at the create-time value.'
+		);
+	}
+
+	/**
 	 * @testdox swapping the postmeta to a different shape rebuilds the side tables (no orphans).
 	 */
 	public function test_postmeta_attributes_replacement_drops_old_rows(): void {
