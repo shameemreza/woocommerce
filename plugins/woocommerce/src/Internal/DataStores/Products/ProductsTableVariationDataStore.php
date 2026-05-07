@@ -279,18 +279,34 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 
 		// Sync the placeholder post title/excerpt for compatibility with
 		// the few wp_posts queries (e.g. autosuggest) that still hit it.
+		//
+		// post_parent is conditional: `read()` defensively sets the
+		// in-memory parent_id to 0 when the parent doesn't currently look
+		// like a variable product (e.g. mid-migration, parent in trash,
+		// type temporarily flipped). Writing that 0 back to
+		// `wp_posts.post_parent` permanently orphans the placeholder and
+		// breaks untrash/recovery — so we only persist `post_parent` when
+		// the in-memory value is >0 or the caller explicitly changed it.
+		$post_data    = array(
+			'post_title'   => (string) $product->get_name(),
+			'post_excerpt' => (string) $product->get_attribute_summary( 'edit' ),
+			'menu_order'   => (int) $product->get_menu_order(),
+			'post_status'  => $product->get_status() ? $product->get_status() : ProductStatus::PUBLISH,
+		);
+		$post_formats = array( '%s', '%s', '%d', '%s' );
+
+		$new_parent = (int) $product->get_parent_id();
+		if ( $new_parent > 0 || array_key_exists( 'parent_id', $changes ) ) {
+			$post_data['post_parent'] = $new_parent;
+			$post_formats[]           = '%d';
+		}
+
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 		$wpdb->update(
 			$wpdb->posts,
-			array(
-				'post_title'   => (string) $product->get_name(),
-				'post_excerpt' => (string) $product->get_attribute_summary( 'edit' ),
-				'post_parent'  => (int) $product->get_parent_id(),
-				'menu_order'   => (int) $product->get_menu_order(),
-				'post_status'  => $product->get_status() ? $product->get_status() : ProductStatus::PUBLISH,
-			),
+			$post_data,
 			array( 'ID' => (int) $product->get_id() ),
-			array( '%s', '%s', '%d', '%d', '%s' ),
+			$post_formats,
 			array( '%d' )
 		);
 		clean_post_cache( $product->get_id() );
