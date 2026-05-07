@@ -221,6 +221,17 @@ class ProductDataSynchronizer {
 	}
 
 	/**
+	 * Whether the migration processor is currently registered with
+	 * BatchProcessingController and (presumably) running on the next
+	 * Action Scheduler tick.
+	 *
+	 * @return bool
+	 */
+	public function is_background_migration_enqueued(): bool {
+		return $this->batch_processing_controller->is_enqueued( PostsToProductsMigrationController::class );
+	}
+
+	/**
 	 * Run the migration synchronously, in batches of `$batch_size`, until
 	 * every pending product is processed or `$max_iterations` is reached.
 	 *
