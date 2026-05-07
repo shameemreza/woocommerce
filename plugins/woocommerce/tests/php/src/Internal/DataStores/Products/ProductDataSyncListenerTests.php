@@ -4,6 +4,7 @@ declare( strict_types = 1 );
 namespace Automattic\WooCommerce\Tests\Internal\DataStores\Products;
 
 use Automattic\WooCommerce\Enums\ProductStockStatus;
+use Automattic\WooCommerce\Internal\CostOfGoodsSold\CogsAwareUnitTestSuiteTrait;
 use Automattic\WooCommerce\Internal\DataStores\Products\CustomProductsTableController;
 use Automattic\WooCommerce\Internal\DataStores\Products\ProductDataSyncListener;
 use Automattic\WooCommerce\Internal\DataStores\Products\ProductDataSynchronizer;
@@ -22,6 +23,7 @@ use WC_Helper_Product;
  */
 class ProductDataSyncListenerTests extends HppsTestCase {
 	use HPPSToggleTrait;
+	use CogsAwareUnitTestSuiteTrait;
 
 	/**
 	 * @var ProductDataSyncListener
@@ -48,6 +50,7 @@ class ProductDataSyncListenerTests extends HppsTestCase {
 		delete_option( ProductDataSynchronizer::DATA_SYNC_ENABLED_OPTION );
 		remove_all_filters( 'woocommerce_hpps_data_sync_enabled' );
 		remove_all_filters( 'woocommerce_hpps_authoritative_source' );
+		$this->disable_cogs_feature();
 
 		$this->clean_up_hpps_setup();
 		parent::tearDown();
@@ -133,6 +136,109 @@ class ProductDataSyncListenerTests extends HppsTestCase {
 		update_post_meta( $product_id, '_some_random_third_party_meta', 'xyz' );
 
 		$this->assertSame( $before, $this->read_column( $product_id, 'price' ) );
+	}
+
+	/*
+	|--------------------------------------------------------------------------
+	| Composite-shape columns (gallery, COGS).
+	|--------------------------------------------------------------------------
+	*/
+
+	/**
+	 * @testdox _product_image_gallery postmeta mirrors into the gallery_image_ids column verbatim.
+	 */
+	public function test_postmeta_update_mirrors_gallery_image_ids(): void {
+		$product_id = $this->create_migrated_simple_product();
+
+		update_post_meta( $product_id, '_product_image_gallery', '11,22,33' );
+
+		$this->assertSame( '11,22,33', $this->read_column( $product_id, 'gallery_image_ids' ) );
+	}
+
+	/**
+	 * @testdox _cogs_total_value postmeta mirrors into the cogs_value column when the COGS feature is enabled.
+	 */
+	public function test_postmeta_update_mirrors_cogs_value_when_feature_on(): void {
+		$this->enable_cogs_feature();
+
+		$product_id = $this->create_migrated_simple_product();
+
+		update_post_meta( $product_id, '_cogs_total_value', '7.50' );
+
+		$column = $this->read_column( $product_id, 'cogs_value' );
+		$this->assertNotNull( $column );
+		// MySQL persists decimal(19,4) as e.g. "7.5000"; cast collapses
+		// the precision tail so we can assert exact equality.
+		$this->assertSame( 7.5, (float) $column );
+	}
+
+	/**
+	 * @testdox _cogs_total_value postmeta is ignored when the COGS feature is disabled (column stays NULL).
+	 */
+	public function test_postmeta_update_skips_cogs_value_when_feature_off(): void {
+		// COGS off (default; suite tearDown also disables it).
+		$product_id = $this->create_migrated_simple_product();
+		$this->assertNull( $this->read_column( $product_id, 'cogs_value' ), 'precondition: cogs_value starts NULL.' );
+
+		update_post_meta( $product_id, '_cogs_total_value', '99.99' );
+
+		$this->assertNull( $this->read_column( $product_id, 'cogs_value' ), 'COGS gate must keep the column NULL when the feature is off.' );
+	}
+
+	/**
+	 * @testdox saving through WC_Product::save() pushes gallery_image_ids back into _product_image_gallery.
+	 */
+	public function test_save_through_wc_api_mirrors_gallery_back_into_postmeta(): void {
+		$product_id = $this->create_migrated_simple_product();
+
+		$product = wc_get_product( $product_id );
+		$product->set_gallery_image_ids( array( 101, 202, 303 ) );
+		$product->save();
+
+		$this->assertSame( '101,202,303', get_post_meta( $product_id, '_product_image_gallery', true ) );
+	}
+
+	/**
+	 * @testdox COGS save mirrors cogs_value back into _cogs_total_value when the feature is enabled.
+	 */
+	public function test_save_through_wc_api_mirrors_cogs_back_into_postmeta_when_feature_on(): void {
+		$this->enable_cogs_feature();
+
+		$product_id = $this->create_migrated_simple_product();
+
+		$product = wc_get_product( $product_id );
+		$product->set_cogs_value( 4.25 );
+		$product->save();
+
+		$this->assertSame( 4.25, (float) get_post_meta( $product_id, '_cogs_total_value', true ) );
+	}
+
+	/**
+	 * @testdox writeback skips _cogs_total_value when the COGS feature is disabled, so non-COGS stores stay clean.
+	 */
+	public function test_save_through_wc_api_skips_cogs_writeback_when_feature_off(): void {
+		// Postmeta starts unset.
+		$product_id = $this->create_migrated_simple_product();
+		delete_post_meta( $product_id, '_cogs_total_value' );
+
+		// Force a non-NULL column value so we can prove the writeback
+		// would have a value to mirror back if the gate were open.
+		global $wpdb;
+		$table = ProductsTableDataStore::get_products_table_name();
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->update( $table, array( 'cogs_value' => '12.0000' ), array( 'id' => $product_id ), array( '%s' ), array( '%d' ) );
+
+		// Trigger the writeback path with COGS still off.
+		$product = wc_get_product( $product_id );
+		$product->set_regular_price( 50.00 );
+		$product->set_price( 50.00 );
+		$product->save();
+
+		// Sanity: writeback ran (non-gated keys still mirror).
+		$this->assertSame( 50.0, (float) get_post_meta( $product_id, '_price', true ) );
+
+		// COGS-gated key did NOT land.
+		$this->assertSame( '', get_post_meta( $product_id, '_cogs_total_value', true ), 'COGS gate must skip writeback when the feature is off.' );
 	}
 
 	/*

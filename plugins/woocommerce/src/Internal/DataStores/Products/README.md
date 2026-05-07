@@ -183,7 +183,17 @@ The HPPS tables are also included in `WC_Install::get_tables()`, so a full WC un
 
 ## Bidirectional sync (opt-in)
 
-`ProductDataSyncListener` keeps `wp_postmeta` and `wc_products` in agreement in both directions, for the curated set of high-impact meta keys defined in `META_TO_COLUMN_MAP` (price, stock, sku, weight and dimensions, virtual/downloadable flags, tax class/status, manage stock, stock status, low-stock amount, sold individually, ratings).
+`ProductDataSyncListener` keeps `wp_postmeta` and `wc_products` in agreement in both directions, for the curated set of high-impact meta keys defined in `META_TO_COLUMN_MAP`:
+
+- Pricing and inventory: price, regular price, sale price, sale-from / sale-to dates, stock quantity, stock status, manage stock, low-stock amount, sold individually, backorders.
+- Identifiers: SKU, global unique ID, barcode, thumbnail ID, image gallery (`_product_image_gallery` ↔ `gallery_image_ids`).
+- Shipping and dimensions: weight, length, width, height.
+- Tax: tax status, tax class.
+- Booleans: virtual, downloadable, featured, visibility.
+- Quality signals: average rating, rating count, review count.
+- Cost of Goods Sold: `_cogs_total_value` ↔ `cogs_value`. Gated on the COGS feature being enabled — sites that never turned it on keep `wc_products.cogs_value` at NULL and never get a stray `_cogs_total_value` postmeta entry.
+
+Side-table data (`_product_attributes` ↔ `wc_product_attributes` / `wc_product_attribute_values`, `_default_attributes`) is the remaining gap. Those updates only land on a full save through the WC API today.
 
 Three ways to enable it:
 
@@ -283,6 +293,6 @@ The HPPS path is also skipped while the migration is still in progress: `wc_prod
 
 These are known and tracked. Don't ship them as bugs.
 
-- **Listener covers the high-impact meta keys, not every column.** Composite columns (`gallery_image_ids`, `date_on_sale_*`) and the COGS columns are not yet mirrored in either direction; they update on the next full save through the WC API.
+- **Listener mirrors columns, not side-table data.** Sale dates, gallery image IDs, and COGS columns are now synced in both directions (COGS gated on the feature being enabled). The remaining gap is `_product_attributes` and `_default_attributes`, which live in `wc_product_attributes` / `wc_product_attribute_values` and only update on a full save through the WC API.
 - **Taxonomies stay in WP.** `product_cat`, `product_tag`, `product_brand`, `product_shipping_class`, and `product_visibility` continue to live in `wp_term_relationships`. Moving them is out of scope for HPPS.
 - **Reports keep using the existing analytics tables.** HPPS feeds `wc_product_meta_lookup` so admin list filters work, but `wc_order_product_lookup` and the WC Analytics tables are unchanged.

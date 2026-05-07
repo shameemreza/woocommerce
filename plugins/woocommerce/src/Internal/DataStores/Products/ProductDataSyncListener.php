@@ -9,6 +9,8 @@ declare( strict_types = 1 );
 
 namespace Automattic\WooCommerce\Internal\DataStores\Products;
 
+use Automattic\WooCommerce\Internal\CostOfGoodsSold\CostOfGoodsSoldController;
+
 defined( 'ABSPATH' ) || exit;
 
 /**
@@ -45,15 +47,22 @@ class ProductDataSyncListener {
 	 * Map of WordPress meta keys to the column name in `wc_products` they
 	 * mirror. Keys are deliberately conservative: only the meta paths that
 	 * have a 1:1 column counterpart and where third-party plugins are most
-	 * likely to write directly. Composite columns (gallery_image_ids,
-	 * date_on_sale_*) and meta that needs richer parsing (cogs_*) are not
-	 * synced here yet — they go through the data store layer in Phase 2.
+	 * likely to write directly. Side-table data (`_product_attributes` →
+	 * `wc_product_attributes` / `wc_product_attribute_values`,
+	 * `_default_attributes`) is not synced here yet — that lift is tracked
+	 * separately because it needs to drop and rebuild rows in two tables,
+	 * not just write a single column.
 	 *
 	 * Each entry declares:
 	 *   - `column`: target column in `wc_products`.
 	 *   - `type`:   how to coerce the postmeta scalar into the column shape.
+	 *   - `gate`:   optional precondition. Currently only `'cogs'`, which
+	 *               skips the entry whenever the Cost of Goods Sold
+	 *               feature is disabled. The HPPS column stays NULL on
+	 *               those stores, and the listener avoids writing empty
+	 *               postmeta back to legacy when no one is watching.
 	 *
-	 * @var array<string, array{column: string, type: string}>
+	 * @var array<string, array{column: string, type: string, gate?: string}>
 	 */
 	private const META_TO_COLUMN_MAP = array(
 		'_sku'                   => array(
@@ -152,6 +161,10 @@ class ProductDataSyncListener {
 			'column' => 'image_id',
 			'type'   => 'int',
 		),
+		'_product_image_gallery' => array(
+			'column' => 'gallery_image_ids',
+			'type'   => 'string',
+		),
 		'_purchase_note'         => array(
 			'column' => 'purchase_note',
 			'type'   => 'string',
@@ -179,6 +192,11 @@ class ProductDataSyncListener {
 		'_wc_review_count'       => array(
 			'column' => 'review_count',
 			'type'   => 'int',
+		),
+		'_cogs_total_value'      => array(
+			'column' => 'cogs_value',
+			'type'   => 'decimal',
+			'gate'   => 'cogs',
 		),
 	);
 
@@ -359,11 +377,24 @@ class ProductDataSyncListener {
 	private function mirror_columns_to_postmeta( int $product_id ): void {
 		global $wpdb;
 
+		// Gates are evaluated up front so we don't read columns we won't
+		// write. A store that never enabled COGS shouldn't pay the cost
+		// of pulling `cogs_value` out of the row, and shouldn't get a
+		// stray `_cogs_total_value` postmeta entry for every product.
+		$active_mappings = array_filter(
+			self::META_TO_COLUMN_MAP,
+			fn( array $mapping ): bool => $this->mapping_gate_satisfied( $mapping )
+		);
+
+		if ( empty( $active_mappings ) ) {
+			return;
+		}
+
 		$columns_csv = implode(
 			', ',
 			array_map(
 				static fn( array $mapping ): string => '`' . $mapping['column'] . '`',
-				self::META_TO_COLUMN_MAP
+				$active_mappings
 			)
 		);
 
@@ -381,8 +412,8 @@ class ProductDataSyncListener {
 
 		self::start_internal_write();
 		try {
-			foreach ( self::META_TO_COLUMN_MAP as $meta_key => $mapping ) {
-				$column        = $mapping['column'];
+			foreach ( $active_mappings as $meta_key => $mapping ) {
+				$column         = $mapping['column'];
 				$postmeta_value = $this->coerce_for_postmeta( $mapping['type'], $row->{$column} ?? null );
 				update_post_meta( $product_id, $meta_key, $postmeta_value );
 			}
@@ -437,7 +468,42 @@ class ProductDataSyncListener {
 		}
 
 		$mapping = self::META_TO_COLUMN_MAP[ $meta_key ];
+
+		if ( ! $this->mapping_gate_satisfied( $mapping ) ) {
+			return;
+		}
+
 		$this->write_column( $object_id, $mapping['column'], $mapping['type'], $meta_value );
+	}
+
+	/**
+	 * Return whether the optional `gate` condition on a mapping is met.
+	 *
+	 * Gates exist for columns that only carry meaningful values when an
+	 * adjacent feature is on. The COGS column is the canonical example:
+	 * sites that never enabled Cost of Goods Sold should keep their
+	 * `wc_products.cogs_value` rows at NULL and their `_cogs_total_value`
+	 * postmeta unset, regardless of what a third-party plugin writes.
+	 *
+	 * Mappings without a `gate` always sync.
+	 *
+	 * @param array{column: string, type: string, gate?: string} $mapping Mapping entry.
+	 * @return bool
+	 */
+	private function mapping_gate_satisfied( array $mapping ): bool {
+		$gate = $mapping['gate'] ?? '';
+
+		if ( '' === $gate ) {
+			return true;
+		}
+
+		if ( 'cogs' === $gate ) {
+			return wc_get_container()->get( CostOfGoodsSoldController::class )->feature_is_enabled();
+		}
+
+		// Unknown gate name — fail closed so we don't silently mirror
+		// values whose preconditions we couldn't verify.
+		return false;
 	}
 
 	/**
