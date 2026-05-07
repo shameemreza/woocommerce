@@ -11,6 +11,7 @@
 - [Rolling back](#rolling-back)
 - [Bidirectional sync (opt-in)](#bidirectional-sync-opt-in)
 - [Authoritative-source flag](#authoritative-source-flag)
+- [Querying products](#querying-products)
 - [Phase 1 limitations](#phase-1-limitations)
 
 ## Summary
@@ -235,6 +236,41 @@ add_filter( 'woocommerce_hpps_authoritative_source', static fn() => 'cpt' );
 ```
 
 This is the seam Phase 2 dual-mode cutover hangs off. In Phase 1 the default keeps HPPS authoritative whenever the feature is on, so existing behaviour doesn't change.
+
+## Querying products
+
+`wc_get_products()`, `WC_Product_Query`, and any caller that goes through `WC_Data_Store::load( 'product' )->query()` route through `ProductsTableDataStore::query()` on HPPS-on stores. The data store hands the args to {@see ProductsTableQuery}, which builds a single `SELECT` against `wc_products` instead of the legacy `WP_Query` against `wp_posts` + 30+ `wp_postmeta` joins.
+
+### What HPPS answers natively
+
+Filters that map straight to a `wc_products` column:
+
+- Identity / catalog: `status`, `type`, `parent`, `parent_exclude`, `include`, `exclude`, `name` (post_title), `featured`, `visibility`.
+- Inventory: `manage_stock`, `stock_status`, `stock_quantity`, `low_stock_amount`, `backorders`, `sold_individually`.
+- Pricing: `price`, `regular_price`, `sale_price`, `total_sales`.
+- Shipping / dimensions: `weight`, `length`, `width`, `height`.
+- Tax: `tax_status`, `tax_class`.
+- Identifiers: `sku` (LIKE plus the `'*'` wildcard), `download_limit`, `download_expiry`.
+- Quality signals: `average_rating`, `review_count`.
+- Booleans: `virtual`, `downloadable`.
+
+Pagination: `limit`, `offset`, `page`, `paginate`. `paginate = true` returns the `{ products, total, max_num_pages }` envelope the legacy data store produces.
+
+Ordering: `orderby` accepts `id`, `date` / `date_created`, `modified` / `date_modified`, `name` / `title`, `sku`, `price` / `regular_price` / `sale_price`, `total_sales` / `popularity`, `rating` / `average_rating`, `stock_quantity`, `menu_order`, `include` / `post__in` (preserves input order via `FIELD()`), `none`. `order` accepts `ASC` / `DESC`.
+
+Return shapes: `return = 'objects'` (default) → `WC_Product[]`; `return = 'ids'` → `int[]`.
+
+### What falls back to the legacy CPT data store
+
+`ProductsTableQuery::is_supported()` returns false (and the data store delegates to `WC_Product_Data_Store_CPT::query()`) when any of these are present and non-empty:
+
+- Taxonomy filters: `category`, `tag`, `shipping_class`. Taxonomies still live in `wp_term_relationships`, so a JOIN is required and not yet implemented in the HPPS path.
+- Arbitrary `meta_query` or `tax_query` clauses.
+- Date queries: `date_query`, `date_created`, `date_modified`, `date_on_sale_from`, `date_on_sale_to`.
+- Full-text search via `s`. (`name` is supported and matches `post_title` exactly via JOIN.)
+- `reviews_allowed`.
+
+The HPPS path is also skipped while the migration is still in progress: `wc_products` only contains a subset of the catalogue, so querying it would silently miss the unmigrated remainder. Once `migration_is_complete()` returns true and the query has no unsupported keys, traffic flows through the column store.
 
 ## Phase 1 limitations
 

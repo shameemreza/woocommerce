@@ -2449,9 +2449,72 @@ CREATE TABLE {$meta_table} (
 	 * @return array
 	 */
 	public function get_products( $args = array() ) {
-		$query = new \WC_Product_Query( $args );
-		$results = $query->get_products();
+		// Drive `wc_get_products()` through the data-store-level query
+		// directly. Going via `WC_Product_Query::get_products()` would
+		// loop back through `WC_Data_Store::load('product')->query()`,
+		// which is the same code path with extra hops; doing it here
+		// cuts the indirection and makes the legacy fallback explicit.
+		$results = $this->query( wp_parse_args( $args, ( new \WC_Product_Query() )->get_query_vars() ) );
+
+		if ( is_object( $results ) && isset( $results->products ) ) {
+			return $results->products;
+		}
+
 		return is_array( $results ) ? $results : array();
+	}
+
+	/**
+	 * `WC_Data_Store::load('product')->query()` entry point.
+	 *
+	 * Routes column-mappable queries through {@see ProductsTableQuery}
+	 * for an HPPS-native SELECT. Anything that needs taxonomy joins,
+	 * arbitrary `meta_query` / `tax_query`, full-text search, date
+	 * queries, or `reviews_allowed` falls back to the legacy CPT data
+	 * store via {@see get_legacy_data_store()}.
+	 *
+	 * The fallback is the safety net for two distinct cases:
+	 *
+	 *   1. Query features HPPS hasn't implemented natively yet — they
+	 *      stay correct (and slow) until they migrate over.
+	 *   2. Stores where the migration hasn't completed yet — running
+	 *      against `wc_products` would silently miss the unmigrated
+	 *      half of the catalogue.
+	 *
+	 * @since 10.9.0
+	 *
+	 * @param array $query_vars Query vars from `WC_Product_Query`.
+	 * @return array<int, int>|array<int, WC_Product>|object
+	 */
+	public function query( $query_vars ) {
+		$query = new ProductsTableQuery( (array) $query_vars );
+
+		if ( ! $query->is_supported() || ! $this->migration_is_complete() ) {
+			return $this->get_legacy_data_store()->query( $query_vars );
+		}
+
+		return $query->get_results();
+	}
+
+	/**
+	 * Whether the HPPS migration has finished for this site. While the
+	 * back-fill is still running, `wc_products` only contains a subset
+	 * of the catalogue — querying it would silently drop the unmigrated
+	 * remainder. Routing through the legacy CPT data store keeps the
+	 * result set complete.
+	 *
+	 * @return bool
+	 */
+	private function migration_is_complete(): bool {
+		try {
+			return wc_get_container()
+				->get( ProductDataSynchronizer::class )
+				->migration_is_complete();
+		} catch ( \Throwable $e ) {
+			// If the synchronizer can't be resolved (very early hook
+			// fire, container reset mid-request), fall back to the
+			// legacy path — safer than guessing.
+			return false;
+		}
 	}
 
 	/**
