@@ -253,11 +253,42 @@ class ProductsTableQuery {
 		'date_modified',
 		'date_on_sale_from',
 		'date_on_sale_to',
-		'category',
-		'tag',
-		'shipping_class',
 		'reviews_allowed',
 		's',
+	);
+
+	/**
+	 * Taxonomy filters HPPS handles natively via EXISTS subqueries on
+	 * `wp_term_relationships`. The slug form takes precedence over the
+	 * ID form when both are present (matches the legacy translator's
+	 * contract, which also gives `category` priority over
+	 * `product_category_id`).
+	 *
+	 * @var array<string, array{taxonomy:string,field:string,fallback_for?:string}>
+	 */
+	private const TAXONOMY_FILTERS = array(
+		'category'            => array(
+			'taxonomy' => 'product_cat',
+			'field'    => 'slug',
+		),
+		'product_category_id' => array(
+			'taxonomy'     => 'product_cat',
+			'field'        => 'id',
+			'fallback_for' => 'category',
+		),
+		'tag'                 => array(
+			'taxonomy' => 'product_tag',
+			'field'    => 'slug',
+		),
+		'product_tag_id'      => array(
+			'taxonomy'     => 'product_tag',
+			'field'        => 'id',
+			'fallback_for' => 'tag',
+		),
+		'shipping_class'      => array(
+			'taxonomy' => 'product_shipping_class',
+			'field'    => 'slug',
+		),
 	);
 
 	/**
@@ -326,6 +357,7 @@ class ProductsTableQuery {
 		$this->build_id_filters( $where_parts, $where_args );
 		$this->build_parent_filters( $where_parts, $where_args );
 		$this->build_name_filter( $where_parts, $where_args, $joins );
+		$this->build_taxonomy_filters( $where_parts, $where_args );
 
 		$where_sql = empty( $where_parts ) ? '1=1' : implode( ' AND ', $where_parts );
 		$join_sql  = empty( $joins ) ? '' : ' ' . implode( ' ', $joins );
@@ -576,6 +608,102 @@ class ProductsTableQuery {
 		$where_parts[] = '( p.name = %s OR posts.post_title = %s )';
 		$where_args[]  = (string) $name;
 		$where_args[]  = (string) $name;
+	}
+
+	/**
+	 * Emit one EXISTS subquery against `wp_term_relationships` per
+	 * present taxonomy filter ({@see TAXONOMY_FILTERS}). Multiple
+	 * filters AND together; multiple values within a single filter
+	 * OR via `IN`, matching the legacy `tax_query` `IN` semantics.
+	 *
+	 * The slug form takes precedence over the ID form: if `category`
+	 * is set, `product_category_id` is ignored even when also present.
+	 *
+	 * If a filter resolves to zero matching `term_taxonomy_id`s (the
+	 * caller passed slugs / IDs that don't exist), we short-circuit
+	 * the entire WHERE with `1=0` so the query returns no rows. That
+	 * matches what `WP_Query` does on an empty `tax_query` term list.
+	 *
+	 * @param string[] $where_parts Output.
+	 * @param mixed[]  $where_args  Output.
+	 */
+	private function build_taxonomy_filters( array &$where_parts, array &$where_args ): void {
+		global $wpdb;
+
+		foreach ( self::TAXONOMY_FILTERS as $key => $config ) {
+			if ( empty( $this->query_vars[ $key ] ) ) {
+				continue;
+			}
+
+			// Slug form already populated this taxonomy — skip the
+			// id-based fallback so we don't double-filter.
+			if ( isset( $config['fallback_for'] ) && ! empty( $this->query_vars[ $config['fallback_for'] ] ) ) {
+				continue;
+			}
+
+			$term_taxonomy_ids = $this->resolve_term_taxonomy_ids(
+				$config['taxonomy'],
+				(array) $this->query_vars[ $key ],
+				$config['field']
+			);
+
+			if ( empty( $term_taxonomy_ids ) ) {
+				$where_parts[] = '1=0';
+				return;
+			}
+
+			$placeholders  = implode( ', ', array_fill( 0, count( $term_taxonomy_ids ), '%d' ) );
+			$where_parts[] = "EXISTS ( SELECT 1 FROM {$wpdb->term_relationships} AS tr_{$config['taxonomy']} WHERE tr_{$config['taxonomy']}.object_id = p.id AND tr_{$config['taxonomy']}.term_taxonomy_id IN ({$placeholders}) )";
+			array_push( $where_args, ...$term_taxonomy_ids );
+		}
+	}
+
+	/**
+	 * Resolve a list of term slugs or IDs into matching
+	 * `term_taxonomy_id`s for a given taxonomy.
+	 *
+	 * Routes through `get_terms()` (rather than rolling our own SQL)
+	 * so callers that have set up filters / fixtures (test factories,
+	 * multilingual plugins, taxonomy term overrides) keep getting the
+	 * same resolution they would on the legacy CPT path.
+	 *
+	 * @param string            $taxonomy Taxonomy slug.
+	 * @param array<int, mixed> $values   Slugs or IDs.
+	 * @param string            $field    Either `'slug'` or `'id'`.
+	 * @return int[] List of `term_taxonomy_id` values.
+	 */
+	private function resolve_term_taxonomy_ids( string $taxonomy, array $values, string $field ): array {
+		$args = array(
+			'taxonomy'   => $taxonomy,
+			'hide_empty' => false,
+		);
+
+		if ( 'slug' === $field ) {
+			$slugs = array_filter( array_map( 'strval', $values ) );
+			if ( empty( $slugs ) ) {
+				return array();
+			}
+			$args['slug'] = $slugs;
+		} else {
+			$ids = array_filter( array_map( 'intval', $values ) );
+			if ( empty( $ids ) ) {
+				return array();
+			}
+			$args['include'] = $ids;
+		}
+
+		$terms = get_terms( $args );
+		if ( is_wp_error( $terms ) || empty( $terms ) ) {
+			return array();
+		}
+
+		$out = array();
+		foreach ( $terms as $term ) {
+			if ( $term instanceof \WP_Term ) {
+				$out[] = (int) $term->term_taxonomy_id;
+			}
+		}
+		return $out;
 	}
 
 	/**

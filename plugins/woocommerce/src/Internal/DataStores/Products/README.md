@@ -254,6 +254,14 @@ Filters that map straight to a `wc_products` column:
 - Quality signals: `average_rating`, `review_count`.
 - Booleans: `virtual`, `downloadable`.
 
+Taxonomy filters resolved via EXISTS subqueries on `wp_term_relationships` (one subquery per taxonomy, slugs / IDs resolved through `get_terms()` so multilingual or test-fixture filters keep working):
+
+- `category` (slug) and `product_category_id` (term id, used only when `category` is empty) → `product_cat`.
+- `tag` (slug) and `product_tag_id` (term id, used only when `tag` is empty) → `product_tag`.
+- `shipping_class` (slug) → `product_shipping_class`.
+
+Multiple taxonomy filters AND together; multiple values within a single filter OR via `IN`. A slug or ID that doesn't resolve to any term short-circuits the WHERE to `1=0`, so an unmatched filter returns no rows instead of falling through to "every product".
+
 Pagination: `limit`, `offset`, `page`, `paginate`. `paginate = true` returns the `{ products, total, max_num_pages }` envelope the legacy data store produces.
 
 Ordering: `orderby` accepts `id`, `date` / `date_created`, `modified` / `date_modified`, `name` / `title`, `sku`, `price` / `regular_price` / `sale_price`, `total_sales` / `popularity`, `rating` / `average_rating`, `stock_quantity`, `menu_order`, `include` / `post__in` (preserves input order via `FIELD()`), `none`. `order` accepts `ASC` / `DESC`.
@@ -264,7 +272,6 @@ Return shapes: `return = 'objects'` (default) → `WC_Product[]`; `return = 'ids
 
 `ProductsTableQuery::is_supported()` returns false (and the data store delegates to `WC_Product_Data_Store_CPT::query()`) when any of these are present and non-empty:
 
-- Taxonomy filters: `category`, `tag`, `shipping_class`. Taxonomies still live in `wp_term_relationships`, so a JOIN is required and not yet implemented in the HPPS path.
 - Arbitrary `meta_query` or `tax_query` clauses.
 - Date queries: `date_query`, `date_created`, `date_modified`, `date_on_sale_from`, `date_on_sale_to`.
 - Full-text search via `s`. (`name` is supported and matches `post_title` exactly via JOIN.)

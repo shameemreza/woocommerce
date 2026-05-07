@@ -21,12 +21,14 @@ use WC_Product_Simple;
  *
  *   1. The HPPS-native query path produces the same result shape and
  *      filtering behaviour as the legacy CPT data store for the
- *      column-mappable filters listed in COLUMN_MAP.
- *   2. Anything that hits an unsupported feature (taxonomy joins,
- *      meta_query, tax_query, date queries, full-text search,
- *      reviews_allowed) falls back to the legacy data store, so the
- *      caller's results stay correct even before we migrate every
- *      query path to HPPS.
+ *      column-mappable filters listed in COLUMN_MAP, plus the
+ *      taxonomy filters we now resolve via EXISTS subqueries on
+ *      `wp_term_relationships` (category, tag, shipping_class, plus
+ *      the term-id alt forms).
+ *   2. Anything that still hits an unsupported feature (meta_query,
+ *      tax_query, date queries, full-text search, reviews_allowed)
+ *      falls back to the legacy data store, so the caller's results
+ *      stay correct even before we migrate every query path to HPPS.
  *
  * The test suite intentionally drives `wc_get_products()` end-to-end
  * (not just `ProductsTableQuery::get_results()` in isolation) — that's
@@ -362,9 +364,6 @@ class ProductsTableQueryTests extends HppsTestCase {
 	 */
 	public function unsupported_keys_provider(): array {
 		return array(
-			'category'        => array( 'category', array( 'shoes' ) ),
-			'tag'             => array( 'tag', array( 'sale' ) ),
-			'shipping_class'  => array( 'shipping_class', array( 'oversized' ) ),
 			'meta_query'      => array( 'meta_query', array( array( 'key' => '_custom', 'value' => 'foo' ) ) ),
 			'tax_query'       => array( 'tax_query', array( array( 'taxonomy' => 'product_cat', 'field' => 'slug', 'terms' => 'shoes' ) ) ),
 			'date_query'      => array( 'date_query', array( array( 'after' => '2024-01-01' ) ) ),
@@ -374,19 +373,26 @@ class ProductsTableQueryTests extends HppsTestCase {
 		);
 	}
 
-	/**
-	 * @testdox category filter falls back to the legacy CPT data store and still returns matching products.
-	 */
-	public function test_category_filter_routes_through_cpt_fallback(): void {
-		$id = $this->migrated_simple_product(
-			array(
-				'sku'  => 'HPPS-Q-CAT-FALLBACK',
-				'name' => 'HPPS Q Cat Fallback',
-			)
-		);
+	/*
+	|--------------------------------------------------------------------------
+	| Taxonomy filters (native EXISTS subqueries, no CPT fallback).
+	|--------------------------------------------------------------------------
+	*/
 
-		$category_id = wp_create_term( 'hpps-q-cat', 'product_cat' )['term_id'];
-		wp_set_object_terms( $id, array( $category_id ), 'product_cat' );
+	/**
+	 * @testdox category filter (slug form) is handled natively and returns only products in the requested category.
+	 */
+	public function test_filter_by_category_slug_native(): void {
+		$wanted   = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-CAT-IN' ) );
+		$unwanted = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-CAT-OUT' ) );
+
+		$term_id = wp_create_term( 'hpps-q-cat', 'product_cat' )['term_id'];
+		wp_set_object_terms( $wanted, array( $term_id ), 'product_cat' );
+
+		// Sanity-check that this is actually answered by the HPPS path,
+		// not by the CPT fallback.
+		$query = new ProductsTableQuery( array( 'category' => array( 'hpps-q-cat' ) ) );
+		$this->assertTrue( $query->is_supported(), 'category should be a natively supported filter.' );
 
 		$results = wc_get_products(
 			array(
@@ -396,7 +402,120 @@ class ProductsTableQueryTests extends HppsTestCase {
 			)
 		);
 
-		$this->assertContains( $id, $results, 'CPT fallback should still return the product when filtering by category slug.' );
+		$this->assertContains( $wanted, $results );
+		$this->assertNotContains( $unwanted, $results );
+	}
+
+	/**
+	 * @testdox tag filter (slug form) is handled natively and returns only products with the requested tag.
+	 */
+	public function test_filter_by_tag_slug_native(): void {
+		$wanted   = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-TAG-IN' ) );
+		$unwanted = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-TAG-OUT' ) );
+
+		$term_id = wp_create_term( 'hpps-q-tag', 'product_tag' )['term_id'];
+		wp_set_object_terms( $wanted, array( $term_id ), 'product_tag' );
+
+		$results = wc_get_products(
+			array(
+				'tag'    => array( 'hpps-q-tag' ),
+				'return' => 'ids',
+				'limit'  => -1,
+			)
+		);
+
+		$this->assertContains( $wanted, $results );
+		$this->assertNotContains( $unwanted, $results );
+	}
+
+	/**
+	 * @testdox shipping_class filter (slug form) is handled natively.
+	 */
+	public function test_filter_by_shipping_class_slug_native(): void {
+		$wanted   = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-SHIP-IN' ) );
+		$unwanted = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-SHIP-OUT' ) );
+
+		$term_id = wp_create_term( 'hpps-q-ship', 'product_shipping_class' )['term_id'];
+		wp_set_object_terms( $wanted, array( $term_id ), 'product_shipping_class' );
+
+		$results = wc_get_products(
+			array(
+				'shipping_class' => array( 'hpps-q-ship' ),
+				'return'         => 'ids',
+				'limit'          => -1,
+			)
+		);
+
+		$this->assertContains( $wanted, $results );
+		$this->assertNotContains( $unwanted, $results );
+	}
+
+	/**
+	 * @testdox product_category_id (term-id form) is honoured when category (slug form) is empty.
+	 */
+	public function test_filter_by_product_category_id_native(): void {
+		$wanted   = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-CATID-IN' ) );
+		$unwanted = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-CATID-OUT' ) );
+
+		$term_id = wp_create_term( 'hpps-q-cat-id', 'product_cat' )['term_id'];
+		wp_set_object_terms( $wanted, array( $term_id ), 'product_cat' );
+
+		$results = wc_get_products(
+			array(
+				'product_category_id' => array( $term_id ),
+				'return'              => 'ids',
+				'limit'               => -1,
+			)
+		);
+
+		$this->assertContains( $wanted, $results );
+		$this->assertNotContains( $unwanted, $results );
+	}
+
+	/**
+	 * @testdox category + tag together AND, not OR.
+	 */
+	public function test_combining_category_and_tag_filters_anded(): void {
+		$cat_only   = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-AND-CAT' ) );
+		$tag_only   = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-AND-TAG' ) );
+		$cat_and_tag = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-AND-BOTH' ) );
+
+		$cat_term = wp_create_term( 'hpps-q-and-cat', 'product_cat' )['term_id'];
+		$tag_term = wp_create_term( 'hpps-q-and-tag', 'product_tag' )['term_id'];
+
+		wp_set_object_terms( $cat_only, array( $cat_term ), 'product_cat' );
+		wp_set_object_terms( $tag_only, array( $tag_term ), 'product_tag' );
+		wp_set_object_terms( $cat_and_tag, array( $cat_term ), 'product_cat' );
+		wp_set_object_terms( $cat_and_tag, array( $tag_term ), 'product_tag' );
+
+		$results = wc_get_products(
+			array(
+				'category' => array( 'hpps-q-and-cat' ),
+				'tag'      => array( 'hpps-q-and-tag' ),
+				'return'   => 'ids',
+				'limit'    => -1,
+			)
+		);
+
+		$this->assertSame( array( $cat_and_tag ), $results, 'Both filters must AND together; cat-only / tag-only must drop out.' );
+	}
+
+	/**
+	 * @testdox A category slug that doesn't exist returns an empty set (no products), not every product.
+	 */
+	public function test_filter_by_nonexistent_category_returns_empty(): void {
+		$id = $this->migrated_simple_product( array( 'sku' => 'HPPS-Q-NOPE' ) );
+
+		$results = wc_get_products(
+			array(
+				'category' => array( 'hpps-q-this-slug-does-not-exist' ),
+				'return'   => 'ids',
+				'limit'    => -1,
+			)
+		);
+
+		$this->assertSame( array(), $results, 'Unmatched taxonomy slugs must short-circuit to no rows.' );
+		$this->assertNotContains( $id, $results );
 	}
 
 	/*
