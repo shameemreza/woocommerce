@@ -1036,6 +1036,15 @@ CREATE TABLE {$meta_table} (
 		wp_trash_post( $product_id );
 		$product->set_status( 'trash' );
 
+		// Drop the cached lookup row. Storefront/admin queries already filter
+		// by post_status so a stale row wouldn't surface visually, but the
+		// row itself drifts away from the canonical wc_products values for
+		// the lifetime of the trash entry, breaks tools that read the lookup
+		// directly (analytics, custom reports, the variations REST endpoint),
+		// and leaks rows when a product is trashed-and-recreated rather than
+		// untrashed.
+		$this->delete_from_lookup_table( $product_id, 'wc_product_meta_lookup' );
+
 		/**
 		 * Fires when a product is trashed under HPPS.
 		 *

@@ -209,6 +209,77 @@ class CustomProductsTableController {
 		add_action( 'woocommerce_sections_advanced', array( $this, 'handle_sync_now_action' ) );
 		add_filter( 'woocommerce_debug_tools', array( $this, 'add_hpps_tools' ), 999 );
 		add_filter( 'removable_query_args', array( $this, 'register_removable_query_args' ) );
+
+		// Untrash recovery: the data store deletes the lookup row on trash
+		// (so analytics readers don't drift), so we have to repopulate it
+		// when the post comes back. Hooking `untrashed_post` keeps us in
+		// step with `wp_untrash_post()` for both UI- and CLI-initiated
+		// untrash and for variations untrashed via their parent.
+		add_action( 'untrashed_post', array( $this, 'on_post_untrashed' ), 20, 1 );
+	}
+
+	/**
+	 * Re-establish the wc_products status and refresh the lookup row when
+	 * an HPPS-native product is untrashed. The data store's trash branch
+	 * sets `wc_products.status = 'trash'` and drops the lookup row; the
+	 * mirror happens here to keep both tables in sync with `wp_posts`.
+	 *
+	 * @internal
+	 *
+	 * @param int $post_id Post id being untrashed.
+	 * @return void
+	 */
+	public function on_post_untrashed( $post_id ): void {
+		global $wpdb;
+
+		$post_id = (int) $post_id;
+		if ( $post_id <= 0 ) {
+			return;
+		}
+
+		$post_type = get_post_type( $post_id );
+		if ( ! in_array( $post_type, array( 'product', 'product_placeholder', 'product_variation' ), true ) ) {
+			return;
+		}
+
+		// Only act if HPPS is the authoritative store and the row exists in wc_products.
+		if ( ! $this->custom_product_tables_usage_is_enabled() ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$exists = (bool) $wpdb->get_var(
+			$wpdb->prepare(
+				'SELECT id FROM %i WHERE id = %d LIMIT 1',
+				ProductsTableDataStore::get_products_table_name(),
+				$post_id
+			)
+		);
+		if ( ! $exists ) {
+			return;
+		}
+
+		$post_status = (string) get_post_status( $post_id );
+		if ( '' === $post_status || 'trash' === $post_status ) {
+			$post_status = 'publish';
+		}
+
+		// Mirror the new wp_posts.post_status onto wc_products.status so the
+		// REST/admin queries that read the column directly stop filtering us
+		// out as trashed.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->update(
+			ProductsTableDataStore::get_products_table_name(),
+			array(
+				'status'            => $post_status,
+				'date_modified_gmt' => gmdate( 'Y-m-d H:i:s' ),
+			),
+			array( 'id' => $post_id ),
+			array( '%s', '%s' ),
+			array( '%d' )
+		);
+
+		$this->simple_data_store->update_lookup_table( $post_id );
 	}
 
 	/**
