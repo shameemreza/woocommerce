@@ -713,10 +713,20 @@ CREATE TABLE {$meta_table} (
 		}
 		$product->set_date_modified( time() );
 
+		// Mirror the product's status onto the placeholder post so any code
+		// path that resolves through `get_post_status()` (REST, the trash
+		// bin UI, third-party plugins) sees the same answer as the
+		// canonical `wc_products.status` column. Default to `publish`
+		// when the product was constructed without an explicit status.
+		$initial_status = (string) $product->get_status( 'edit' );
+		if ( '' === $initial_status ) {
+			$initial_status = 'publish';
+		}
+
 		$post_id = wp_insert_post(
 			array(
 				'post_type'    => CustomProductsTableController::PLACEHOLDER_POST_TYPE,
-				'post_status'  => 'publish',
+				'post_status'  => $initial_status,
 				'post_title'   => $product->get_name() ? $product->get_name() : __( 'Product', 'woocommerce' ),
 				'post_author'  => get_current_user_id(),
 				'ping_status'  => 'closed',
@@ -886,16 +896,37 @@ CREATE TABLE {$meta_table} (
 			);
 		}
 
-		// Keep the placeholder post title roughly aligned with the product name
-		// so any incidental wp_posts query (e.g. menu order, parent lookups)
-		// still surfaces a sensible title for debugging.
+		// Keep the placeholder post in step with the product. We mirror:
+		//   * `post_title`  on a name change (so admin previews and the
+		//                   placeholder permalink lookups still surface a
+		//                   sensible label);
+		//   * `post_status` on a status change (so any code path that uses
+		//                   `get_post_status()` — REST endpoints, third-party
+		//                   plugins, the trash bin UI — stays in sync with
+		//                   the canonical `wc_products.status`).
+		// We accumulate the dirty columns and issue a single UPDATE so we
+		// don't pay for two round-trips when both change.
+		$post_data    = array();
+		$post_formats = array();
 		if ( array_key_exists( 'name', $changes ) ) {
+			$post_data['post_title'] = (string) $product->get_name();
+			$post_formats[]          = '%s';
+		}
+		if ( array_key_exists( 'status', $changes ) ) {
+			$new_status = (string) $product->get_status();
+			if ( '' === $new_status ) {
+				$new_status = 'publish';
+			}
+			$post_data['post_status'] = $new_status;
+			$post_formats[]           = '%s';
+		}
+		if ( ! empty( $post_data ) ) {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$wpdb->update(
 				$wpdb->posts,
-				array( 'post_title' => (string) $product->get_name() ),
+				$post_data,
 				array( 'ID' => (int) $product->get_id() ),
-				array( '%s' ),
+				$post_formats,
 				array( '%d' )
 			);
 			clean_post_cache( $product->get_id() );
