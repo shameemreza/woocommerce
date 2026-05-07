@@ -2564,4 +2564,394 @@ CREATE TABLE {$meta_table} (
 		);
 	}
 
+	/*
+	|--------------------------------------------------------------------------
+	| Methods that the legacy CPT data store exposes to core callers.
+	|
+	| These are not part of the WC_Product_Data_Store_Interface contract but
+	| they ARE called from REST controllers, the admin Products list, and the
+	| classic AJAX endpoints. Without native HPPS implementations the calls
+	| would dead-end in WC_Data_Store::__call() returning null, silently
+	| breaking admin search, "Generate variations", and review counters.
+	|--------------------------------------------------------------------------
+	*/
+
+	/**
+	 * Search products by title, SKU, and global unique ID.
+	 *
+	 * Mirrors the legacy CPT data store's `search_products()` shape so that
+	 * the admin Products list table search box, the product autocomplete
+	 * AJAX endpoint, and the downloadable-product picker keep returning real
+	 * results when HPPS is on.
+	 *
+	 * Strategy: query `wc_products` directly (which has indexed columns for
+	 * `name` and `sku`). For variations, also probe the parent's row so that
+	 * a parent's SKU resolves its variations the way the legacy lookup-table
+	 * join does.
+	 *
+	 * @param string     $term               Search term.
+	 * @param string     $type               Optional product type filter (`virtual`, `downloadable`, ...).
+	 * @param bool       $include_variations Whether to include variations in the result set.
+	 * @param bool       $all_statuses       Search across every status (otherwise publish + private when allowed).
+	 * @param int|null   $limit              Optional cap on the result count.
+	 * @param array|null $include            Whitelist of IDs to keep.
+	 * @param array|null $exclude            Blacklist of IDs to drop.
+	 * @return int[] List of product IDs.
+	 */
+	public function search_products( $term, $type = '', $include_variations = false, $all_statuses = false, $limit = null, $include = null, $exclude = null ) {
+		global $wpdb;
+
+		/**
+		 * Filter to short-circuit HPPS product search with a custom result.
+		 *
+		 * Mirrors `woocommerce_product_pre_search_products` from the legacy
+		 * data store so existing extensions that hook there keep working
+		 * without modification.
+		 *
+		 * @since 10.9.0
+		 *
+		 * @param false|array $custom_results Pre-computed result set, or false to fall through.
+		 * @param string      $term           Search term.
+		 * @param string      $type           Type filter.
+		 * @param bool        $include_variations Variations included.
+		 * @param bool        $all_statuses   All statuses included.
+		 * @param int|null    $limit          Result cap.
+		 */
+		$custom_results = apply_filters( 'woocommerce_product_pre_search_products', false, $term, $type, $include_variations, $all_statuses, $limit );
+		if ( is_array( $custom_results ) ) {
+			return $custom_results;
+		}
+
+		$products_table = self::get_products_table_name();
+		$types          = $include_variations
+			? array( 'simple', 'variable', 'grouped', 'external', 'variation' )
+			: array( 'simple', 'variable', 'grouped', 'external' );
+
+		/**
+		 * Filter the post statuses considered when searching products.
+		 *
+		 * @since 10.9.0
+		 *
+		 * @param string[] $statuses Statuses to include.
+		 */
+		$statuses = apply_filters(
+			'woocommerce_search_products_post_statuses',
+			current_user_can( 'edit_private_products' ) ? array( 'private', 'publish' ) : array( 'publish' )
+		);
+
+		$where  = array();
+		$params = array();
+
+		// Type column scope (always applied).
+		$type_placeholders = implode( ',', array_fill( 0, count( $types ), '%s' ) );
+		$where[]           = "p.type IN ({$type_placeholders})";
+		$params            = array_merge( $params, $types );
+
+		// Status scope unless caller asked for everything.
+		if ( ! $all_statuses ) {
+			$status_placeholders = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
+			$where[]             = "p.status IN ({$status_placeholders})";
+			$params              = array_merge( $params, $statuses );
+		}
+
+		// Build the OR-set across name / sku / global_unique_id. Honour
+		// space-and-quote tokenisation the way the legacy store does so that
+		// merchant muscle memory ("nike air") still works.
+		$term_groups = stristr( $term, ' or ' ) ? preg_split( '/\s+or\s+/i', $term ) : array( $term );
+
+		$group_clauses = array();
+		foreach ( $term_groups as $term_group ) {
+			$tokens = $this->tokenize_search_term( (string) $term_group );
+			if ( empty( $tokens ) ) {
+				continue;
+			}
+
+			$token_clauses = array();
+			foreach ( $tokens as $token ) {
+				$like            = '%' . $wpdb->esc_like( $token ) . '%';
+				$token_clauses[] = $wpdb->prepare(
+					'( p.name LIKE %s OR p.short_description LIKE %s OR p.description LIKE %s OR p.sku LIKE %s OR p.global_unique_id LIKE %s )',
+					$like,
+					$like,
+					$like,
+					$like,
+					$like
+				);
+			}
+
+			if ( ! empty( $token_clauses ) ) {
+				$group_clauses[] = '(' . implode( ' AND ', $token_clauses ) . ')';
+			}
+		}
+
+		if ( ! empty( $group_clauses ) ) {
+			$where[] = '(' . implode( ' OR ', $group_clauses ) . ')';
+		}
+
+		// Type-specific narrowing matches the legacy contract.
+		if ( 'virtual' === $type ) {
+			$where[] = 'p.virtual = 1';
+		} elseif ( 'downloadable' === $type ) {
+			$where[] = 'p.downloadable = 1';
+		}
+
+		if ( ! empty( $include ) && is_array( $include ) ) {
+			$where[] = 'p.id IN (' . implode( ',', array_map( 'absint', $include ) ) . ')';
+		}
+		if ( ! empty( $exclude ) && is_array( $exclude ) ) {
+			$where[] = 'p.id NOT IN (' . implode( ',', array_map( 'absint', $exclude ) ) . ')';
+		}
+
+		$where_clause = implode( ' AND ', $where );
+
+		$limit_clause = '';
+		if ( $limit ) {
+			$limit_clause = $wpdb->prepare( ' LIMIT %d', (int) $limit );
+		}
+
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$rows = $wpdb->get_results(
+			empty( $params )
+				? "SELECT DISTINCT p.id, p.parent_id FROM {$products_table} p WHERE {$where_clause} ORDER BY p.parent_id ASC, p.name ASC{$limit_clause}"
+				: $wpdb->prepare( "SELECT DISTINCT p.id, p.parent_id FROM {$products_table} p WHERE {$where_clause} ORDER BY p.parent_id ASC, p.name ASC{$limit_clause}", $params )
+		);
+		// phpcs:enable
+
+		$ids = array();
+		foreach ( (array) $rows as $row ) {
+			$ids[] = (int) $row->id;
+			if ( $include_variations && ! empty( $row->parent_id ) ) {
+				$ids[] = (int) $row->parent_id;
+			}
+		}
+
+		// Numeric search term should also resolve directly by ID, mirroring
+		// the legacy data store's behaviour (operators paste an order line's
+		// product ID into the box and expect it to surface).
+		if ( is_numeric( $term ) ) {
+			$post_id   = absint( $term );
+			$row_type  = (string) $wpdb->get_var( $wpdb->prepare( "SELECT type FROM {$products_table} WHERE id = %d", $post_id ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			$parent_id = (int) $wpdb->get_var( $wpdb->prepare( "SELECT parent_id FROM {$products_table} WHERE id = %d", $post_id ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+			if ( 'variation' === $row_type && $include_variations ) {
+				$ids[] = $post_id;
+			} elseif ( '' !== $row_type && 'variation' !== $row_type ) {
+				$ids[] = $post_id;
+			}
+			if ( $parent_id ) {
+				$ids[] = $parent_id;
+			}
+		}
+
+		return wp_parse_id_list( $ids );
+	}
+
+	/**
+	 * Tokenise a search term the way the legacy store does (quoted phrases,
+	 * stop-word collapse, sentence fallback for very long inputs).
+	 *
+	 * @param string $term_group A single OR-segment of the user input.
+	 * @return string[]
+	 */
+	protected function tokenize_search_term( string $term_group ): array {
+		if ( '' === trim( $term_group ) ) {
+			return array();
+		}
+
+		if ( preg_match_all( '/".*?("|$)|((?<=[\t ",+])|^)[^\t ",+]+/', $term_group, $matches ) ) {
+			$tokens = array_filter( array_map( 'trim', (array) $matches[0] ) );
+			$count  = count( $tokens );
+			if ( $count > 9 || 0 === $count ) {
+				$tokens = array( $term_group );
+			}
+		} else {
+			$tokens = array( $term_group );
+		}
+
+		return array_values( array_filter( array_map( 'trim', $tokens ), 'strlen' ) );
+	}
+
+	/**
+	 * Generate every missing variation for a variable product.
+	 *
+	 * Wired by `WC_AJAX::link_all_variations` and the REST `variations/generate`
+	 * endpoint. The algorithm itself is identical to the legacy CPT store —
+	 * the variation objects we produce go through `WC_Product_Variation::save()`,
+	 * which in turn lands in `ProductsTableVariationDataStore::create()` because
+	 * of the data-store filter swap. So we only need to host the orchestration
+	 * here, not duplicate the persistence logic.
+	 *
+	 * @param \WC_Product $product        Parent variable product.
+	 * @param int         $limit          Hard cap on the number of new variations to create. -1 = unlimited.
+	 * @param array       $default_values Default property values applied to every new variation.
+	 * @param array       $metadata       Additional meta (each item: ['key' => ..., 'value' => ...]).
+	 * @return int Count of new variations created.
+	 */
+	public function create_all_product_variations( $product, $limit = -1, $default_values = array(), $metadata = array() ) {
+		$count = 0;
+
+		if ( ! $product instanceof \WC_Product ) {
+			return $count;
+		}
+
+		$attributes = wc_list_pluck(
+			array_filter( $product->get_attributes(), 'wc_attributes_array_filter_variation' ),
+			'get_slugs'
+		);
+		if ( empty( $attributes ) ) {
+			return $count;
+		}
+
+		// Snapshot existing variation attribute combinations so we don't
+		// duplicate them on a re-run.
+		$existing_attributes = array();
+		$child_ids           = $product->get_children();
+		if ( ! empty( $child_ids ) ) {
+			_prime_post_caches( $child_ids );
+			foreach ( $child_ids as $child_id ) {
+				$child = wc_get_product( $child_id );
+				if ( $child ) {
+					$existing_attributes[] = $child->get_attributes();
+				}
+			}
+		}
+
+		$possible_attributes = array_reverse( wc_array_cartesian( $attributes ) );
+		$product_id          = $product->get_id();
+
+		foreach ( $possible_attributes as $possible_attribute ) {
+			// Loose-match (intentional non-strict) because attribute key
+			// order isn't guaranteed across stores/extensions.
+			if ( in_array( $possible_attribute, $existing_attributes, false ) ) { // phpcs:ignore WordPress.PHP.StrictInArray.MissingTrueStrict
+				continue;
+			}
+
+			$variation = wc_get_product_object( \Automattic\WooCommerce\Enums\ProductType::VARIATION );
+			$variation->set_props( $default_values );
+			foreach ( $metadata as $meta ) {
+				if ( isset( $meta['key'] ) ) {
+					$variation->add_meta_data( $meta['key'], $meta['value'] ?? '' );
+				}
+			}
+			$variation->set_parent_id( $product_id );
+			$variation->set_attributes( $possible_attribute );
+			$variation_id = $variation->save();
+
+			/**
+			 * Fires once per newly created variation, mirroring the legacy hook.
+			 *
+			 * @since 10.9.0
+			 *
+			 * @param int $variation_id Newly inserted variation ID.
+			 */
+			do_action( 'product_variation_linked', $variation_id );
+
+			++$count;
+			if ( $limit > 0 && $count >= $limit ) {
+				break;
+			}
+		}
+
+		return $count;
+	}
+
+	/**
+	 * Persist a product's average rating.
+	 *
+	 * Stores the value on the `wc_products.average_rating` column, refreshes
+	 * the `wc_product_meta_lookup` row, and keeps the legacy `_wc_average_rating`
+	 * postmeta in sync so any extension still reading via `get_post_meta()`
+	 * sees the same value.
+	 *
+	 * @param \WC_Product $product Product object.
+	 * @return void
+	 */
+	public function update_average_rating( $product ) {
+		if ( ! $product instanceof \WC_Product ) {
+			return;
+		}
+
+		global $wpdb;
+
+		$product_id = (int) $product->get_id();
+		$rating     = $product->get_average_rating( 'edit' );
+
+		$wpdb->update(
+			self::get_products_table_name(),
+			array( 'average_rating' => $rating ),
+			array( 'id' => $product_id ),
+			array( '%f' ),
+			array( '%d' )
+		);
+
+		update_post_meta( $product_id, '_wc_average_rating', $rating );
+		$this->update_lookup_table( $product_id );
+		$this->sync_visibility_terms( $product, true );
+	}
+
+	/**
+	 * Persist a product's review count.
+	 *
+	 * @param \WC_Product $product Product object.
+	 * @return void
+	 */
+	public function update_review_count( $product ) {
+		if ( ! $product instanceof \WC_Product ) {
+			return;
+		}
+
+		global $wpdb;
+
+		$product_id = (int) $product->get_id();
+		$count      = (int) $product->get_review_count( 'edit' );
+
+		$wpdb->update(
+			self::get_products_table_name(),
+			array( 'review_count' => $count ),
+			array( 'id' => $product_id ),
+			array( '%d' ),
+			array( '%d' )
+		);
+
+		update_post_meta( $product_id, '_wc_review_count', $count );
+		$this->update_lookup_table( $product_id );
+	}
+
+	/**
+	 * Persist a product's per-star rating distribution.
+	 *
+	 * The aggregate count lives on `wc_products.rating_count`; the per-star
+	 * breakdown (1-5) is keyed in `wc_products_meta` under `_wc_rating_count`
+	 * so an extension drawing the histogram still resolves the structure via
+	 * `$product->get_meta()`.
+	 *
+	 * @param \WC_Product $product Product object.
+	 * @return void
+	 */
+	public function update_rating_counts( $product ) {
+		if ( ! $product instanceof \WC_Product ) {
+			return;
+		}
+
+		global $wpdb;
+
+		$product_id = (int) $product->get_id();
+		$counts     = $product->get_rating_counts( 'edit' );
+		if ( ! is_array( $counts ) ) {
+			$counts = array();
+		}
+		$total = array_sum( array_map( 'absint', $counts ) );
+
+		$wpdb->update(
+			self::get_products_table_name(),
+			array( 'rating_count' => $total ),
+			array( 'id' => $product_id ),
+			array( '%d' ),
+			array( '%d' )
+		);
+
+		update_post_meta( $product_id, '_wc_rating_count', $counts );
+		$this->update_lookup_table( $product_id );
+	}
+
 }
