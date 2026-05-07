@@ -1126,8 +1126,17 @@ CREATE TABLE {$meta_table} (
 	 * @return void
 	 */
 	protected function hydrate_from_row( WC_Product &$product, object $row ): void {
+		$cogs_enabled = $this->cogs_feature_is_enabled();
+
 		foreach ( $this->product_column_mapping as $column => $mapping ) {
 			if ( 'id' === $column || 'gallery_image_ids' === $column ) {
+				continue;
+			}
+
+			// WC_Product::set_cogs_value() emits _doing_it_wrong when the COGS
+			// feature is off, so skip the setter entirely in that case rather
+			// than spam the log on every front-end read.
+			if ( 'cogs_value' === $column && ! $cogs_enabled ) {
 				continue;
 			}
 
