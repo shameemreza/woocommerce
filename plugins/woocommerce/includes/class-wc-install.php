@@ -12,6 +12,7 @@ use Automattic\WooCommerce\Enums\ProductType;
 use Automattic\WooCommerce\Internal\Admin\EmailImprovements\EmailImprovements;
 use Automattic\WooCommerce\Internal\TransientFiles\TransientFilesEngine;
 use Automattic\WooCommerce\Internal\DataStores\Orders\{ CustomOrdersTableController, DataSynchronizer, OrdersTableDataStore };
+use Automattic\WooCommerce\Internal\DataStores\Products\{ CustomProductsTableController, ProductsTableDataStore };
 use Automattic\WooCommerce\Internal\DataStores\StockNotifications\StockNotificationsDataStore;
 use Automattic\WooCommerce\Internal\Features\FeaturesController;
 use Automattic\WooCommerce\Internal\ProductAttributesLookup\DataRegenerator;
@@ -1900,6 +1901,12 @@ class WC_Install {
 			self::should_enable_hpos_for_new_shop();
 		$hpos_table_schema  = $hpos_enabled ? wc_get_container()->get( OrdersTableDataStore::class )->get_database_schema() : '';
 
+		// HPPS (custom_product_tables) schema is created when the feature is enabled.
+		// Tables are additive: they sit alongside wp_posts/wp_postmeta and don't
+		// replace anything until the data store swap goes live.
+		$hpps_enabled      = $feature_controller->feature_is_enabled( CustomProductsTableController::CUSTOM_PRODUCT_TABLES_USAGE_ENABLED_OPTION );
+		$hpps_table_schema = $hpps_enabled ? wc_get_container()->get( ProductsTableDataStore::class )->get_database_schema() : '';
+
 		// Stock Notifications Table Schema.
 		$stock_notifications_table_schema = wc_get_container()->get( StockNotificationsDataStore::class )->get_database_schema();
 		$order_stats_table_schema         = self::get_order_stats_table_schema( $collate );
@@ -2245,6 +2252,7 @@ CREATE TABLE {$wpdb->prefix}wc_category_lookup (
 	PRIMARY KEY (category_tree_id,category_id)
 ) $collate;
 $hpos_table_schema;
+$hpps_table_schema;
 $stock_notifications_table_schema;
 		";
 
@@ -2303,6 +2311,13 @@ $stock_notifications_table_schema;
 			"{$wpdb->prefix}wc_order_addresses",
 			"{$wpdb->prefix}wc_order_operational_data",
 			"{$wpdb->prefix}wc_orders_meta",
+
+			// HPPS.
+			"{$wpdb->prefix}wc_products",
+			"{$wpdb->prefix}wc_product_attributes",
+			"{$wpdb->prefix}wc_product_attribute_values",
+			"{$wpdb->prefix}wc_product_downloads",
+			"{$wpdb->prefix}wc_products_meta",
 		);
 
 		/**

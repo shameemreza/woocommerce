@@ -7,6 +7,7 @@
  */
 
 use Automattic\WooCommerce\Database\Migrations\CustomOrderTable\CLIRunner as CustomOrdersTableCLIRunner;
+use Automattic\WooCommerce\Database\Migrations\CustomProductsTable\CLIRunner as CustomProductsTableCLIRunner;
 use Automattic\WooCommerce\Internal\ProductAttributesLookup\CLIRunner as ProductAttributesLookupCLIRunner;
 use Automattic\WooCommerce\Internal\Integrations\WPPostsImporter;
 use Automattic\WooCommerce\Utilities\FeaturesUtil;
@@ -70,6 +71,8 @@ class WC_CLI {
 			WP_CLI::add_hook( 'after_wp_load', 'Automattic\WooCommerce\Internal\CLI\Migrator\Runner::register_commands' );
 		}
 		$cli_runner = wc_get_container()->get( CustomOrdersTableCLIRunner::class );
+		WP_CLI::add_hook( 'after_wp_load', array( $cli_runner, 'register_commands' ) );
+		$cli_runner = wc_get_container()->get( CustomProductsTableCLIRunner::class );
 		WP_CLI::add_hook( 'after_wp_load', array( $cli_runner, 'register_commands' ) );
 		$cli_runner = wc_get_container()->get( ProductAttributesLookupCLIRunner::class );
 		WP_CLI::add_hook( 'after_wp_load', fn() => \WP_CLI::add_command( 'wc palt', $cli_runner ) );

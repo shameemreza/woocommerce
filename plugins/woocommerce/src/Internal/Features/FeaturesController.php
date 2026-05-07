@@ -14,6 +14,7 @@ use Automattic\Jetpack\Constants;
 use Automattic\WooCommerce\Internal\Admin\Analytics;
 use Automattic\WooCommerce\Internal\Caches\ProductCacheController;
 use Automattic\WooCommerce\Internal\DataStores\Orders\CustomOrdersTableController;
+use Automattic\WooCommerce\Internal\DataStores\Products\CustomProductsTableController;
 use Automattic\WooCommerce\Internal\CostOfGoodsSold\CostOfGoodsSoldController;
 use Automattic\WooCommerce\Internal\PushNotifications\PushNotifications;
 use Automattic\WooCommerce\Proxies\LegacyProxy;
@@ -270,6 +271,7 @@ class FeaturesController {
 			// and aren't processed in init_feature_definitions to avoid circular calls in the dependency injection container.
 			$container = wc_get_container();
 			$container->get( CustomOrdersTableController::class )->add_feature_definition( $this );
+			$container->get( CustomProductsTableController::class )->add_feature_definition( $this );
 			$container->get( CostOfGoodsSoldController::class )->add_feature_definition( $this );
 
 			$this->init_compatibility_info_by_feature();
