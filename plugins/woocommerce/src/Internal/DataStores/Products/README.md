@@ -153,6 +153,16 @@ Options:
 
 Exits 1 if any mismatch is found, 0 otherwise.
 
+The CLI shares its diff engine (`ProductMigrationVerifier`) with the WooCommerce, Status, Tools, "Verify HPPS integrity" button, so the heuristic admin button and the deep CLI report agree on what counts as a mismatch.
+
+## Tools page
+
+`WooCommerce, Status, Tools` exposes three HPPS entries:
+
+- **Sync products to HPPS**: runs the migration synchronously in small batches. Safe to repeat — already-migrated products are skipped. Reports the migrated / skipped / errors / iterations summary as a flash message.
+- **Verify HPPS integrity**: runs `ProductMigrationVerifier` over the first 25 HPPS products. Returns either "all match" or a brief preview of the first three mismatched products with the diverging field names. For deeper triage, run `wp wc hpps verify` from the CLI — the message points at it.
+- **Delete the HPPS tables**: destructive, only enabled when the feature is off (mirrors the HPOS Tools UX). Drops every HPPS table in one shot.
+
 ## Hooks
 
 HPPS mirrors the legacy hook surface so existing extensions keep working. The data store fires:

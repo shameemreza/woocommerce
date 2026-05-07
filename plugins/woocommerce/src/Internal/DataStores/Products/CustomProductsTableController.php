@@ -121,6 +121,13 @@ class CustomProductsTableController {
 	private ProductDataSyncListener $sync_listener;
 
 	/**
+	 * CPT ↔ HPPS structural verifier shared with the WP-CLI command.
+	 *
+	 * @var ProductMigrationVerifier
+	 */
+	private ProductMigrationVerifier $verifier;
+
+	/**
 	 * Constructor: register hooks. Dependencies are injected later via init().
 	 */
 	public function __construct() {
@@ -147,6 +154,7 @@ class CustomProductsTableController {
 	 * @param ProductsTableGroupedDataStore   $grouped_data_store    Grouped HPPS data store.
 	 * @param ProductDataSynchronizer         $data_synchronizer     Data synchronizer (table lifecycle + migration).
 	 * @param ProductDataSyncListener         $sync_listener         Postmeta → wc_products listener.
+	 * @param ProductMigrationVerifier        $verifier              Shared verifier (Tools page + WP-CLI).
 	 */
 	final public function init(
 		FeaturesController $features_controller,
@@ -156,7 +164,8 @@ class CustomProductsTableController {
 		ProductsTableVariationDataStore $variation_data_store,
 		ProductsTableGroupedDataStore $grouped_data_store,
 		ProductDataSynchronizer $data_synchronizer,
-		ProductDataSyncListener $sync_listener
+		ProductDataSyncListener $sync_listener,
+		ProductMigrationVerifier $verifier
 	): void {
 		$this->features_controller  = $features_controller;
 		$this->plugin_util          = $plugin_util;
@@ -166,6 +175,7 @@ class CustomProductsTableController {
 		$this->grouped_data_store   = $grouped_data_store;
 		$this->data_synchronizer    = $data_synchronizer;
 		$this->sync_listener        = $sync_listener;
+		$this->verifier             = $verifier;
 
 		// The listener gates itself on the data-sync option, so registering
 		// once is safe even when sync is off — it just no-ops on every hook.
@@ -422,10 +432,14 @@ class CustomProductsTableController {
 	/**
 	 * Add HPPS entries to WooCommerce → Status → Tools.
 	 *
-	 * Two tools:
+	 * Three tools:
 	 *  - "Sync products to HPPS" — kicks the migration synchronously (small
 	 *    batch) so an operator can move work along without waiting for the
 	 *    Action Scheduler tick.
+	 *  - "Verify HPPS integrity" — quick structural sample diff (legacy CPT
+	 *    vs. HPPS) for the first 25 migrated products. Reports any per-field
+	 *    mismatches as a flash message and points the operator at the
+	 *    `wp wc hpps verify` CLI for the full report.
 	 *  - "Delete the HPPS tables" — destructive, only enabled when the
 	 *    feature is off and no migration is queued. Mirrors HPOS exactly.
 	 *
@@ -461,6 +475,14 @@ class CustomProductsTableController {
 			'button'           => __( 'Sync', 'woocommerce' ),
 		);
 
+		$tools_array['verify_hpps_integrity'] = array(
+			'name'             => __( 'Verify HPPS integrity', 'woocommerce' ),
+			'desc'             => __( 'Quick structural check that compares a sample of migrated products read through the legacy CPT data store with the same products read through HPPS, and reports any per-field mismatches. For a full audit, run <code>wp wc hpps verify</code> from the command line.', 'woocommerce' ),
+			'requires_refresh' => true,
+			'callback'         => array( $this, 'run_verify_integrity_tool' ),
+			'button'           => __( 'Verify', 'woocommerce' ),
+		);
+
 		$can_delete = ! $this->custom_product_tables_usage_is_enabled();
 		$tools_array['delete_hpps_tables'] = array(
 			'name'             => __( 'Delete the HPPS tables', 'woocommerce' ),
@@ -484,6 +506,77 @@ class CustomProductsTableController {
 		);
 
 		return $tools_array;
+	}
+
+	/**
+	 * Tools-page callback for "Verify HPPS integrity".
+	 *
+	 * Runs a 25-product sample diff via {@see ProductMigrationVerifier} and
+	 * returns an HTML-safe summary string suitable for the admin notice that
+	 * the Tools page renders. Drilling into individual fields is intentionally
+	 * delegated to `wp wc hpps verify` — keeps the admin UX terse and the
+	 * report formatting in one place.
+	 *
+	 * @internal Tool callback; rendered into the Tools page admin notice.
+	 *
+	 * @return string Translated, escaped status message.
+	 */
+	public function run_verify_integrity_tool(): string {
+		if ( ! $this->custom_product_tables_usage_is_enabled() ) {
+			return esc_html__( 'HPPS is not enabled. Turn it on under WooCommerce → Settings → Advanced → Features before verifying.', 'woocommerce' );
+		}
+		if ( ! $this->data_synchronizer->check_products_table_exists() ) {
+			return esc_html__( 'HPPS tables are not set up yet — turn the feature on first so they can be created.', 'woocommerce' );
+		}
+
+		// Sample size: 25 keeps the request well under the admin-page time
+		// budget on a busy box. The CLI is the right tool for whole-catalog
+		// audits.
+		$report = $this->verifier->verify( array( 'limit' => 25 ) );
+
+		if ( 0 === $report['checked'] ) {
+			return esc_html__( 'No products live in the HPPS tables yet. Run "Sync products to HPPS" above first.', 'woocommerce' );
+		}
+
+		if ( empty( $report['mismatches'] ) ) {
+			return sprintf(
+				/* translators: %d: number of products successfully verified. */
+				esc_html__( 'Verified %d product(s). All fields match between the legacy CPT data store and HPPS.', 'woocommerce' ),
+				(int) $report['checked']
+			);
+		}
+
+		$preview        = array_slice( $report['mismatches'], 0, 3 );
+		$preview_chunks = array();
+		foreach ( $preview as $entry ) {
+			if ( ! empty( $entry['error'] ) ) {
+				$preview_chunks[] = sprintf(
+					/* translators: 1: product ID; 2: error message describing why the product could not be loaded. */
+					esc_html__( '#%1$d: %2$s', 'woocommerce' ),
+					(int) $entry['id'],
+					esc_html( (string) $entry['error'] )
+				);
+				continue;
+			}
+			$field_names      = array_keys( (array) ( $entry['fields'] ?? array() ) );
+			$preview_chunks[] = sprintf(
+				/* translators: 1: product ID; 2: comma-separated list of mismatching field names. */
+				esc_html__( '#%1$d (%2$s)', 'woocommerce' ),
+				(int) $entry['id'],
+				esc_html( implode( ', ', $field_names ) )
+			);
+		}
+
+		// Use one composite message rather than two paragraphs because the
+		// admin notice container collapses double <br> sequences.
+		return sprintf(
+			/* translators: 1: number of mismatched products; 2: number of products checked; 3: comma-separated preview of the first mismatched products; 4: <code>wp wc hpps verify</code>. */
+			esc_html__( 'Found %1$d mismatched product(s) out of %2$d checked. First mismatches: %3$s. Run %4$s for the full diff.', 'woocommerce' ),
+			count( $report['mismatches'] ),
+			(int) $report['checked'],
+			implode( '; ', $preview_chunks ),
+			'<code>wp wc hpps verify</code>'
+		);
 	}
 
 	/**
