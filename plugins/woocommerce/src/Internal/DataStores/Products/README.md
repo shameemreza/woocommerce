@@ -184,17 +184,20 @@ The HPPS tables are also included in `WC_Install::get_tables()`, so a full WC un
 
 `ProductDataSyncListener` keeps `wp_postmeta` and `wc_products` in agreement in both directions, for the curated set of high-impact meta keys defined in `META_TO_COLUMN_MAP` (price, stock, sku, weight and dimensions, virtual/downloadable flags, tax class/status, manage stock, stock status, low-stock amount, sold individually, ratings).
 
-Enable it with:
+Three ways to enable it:
 
-```php
-update_option( 'woocommerce_custom_product_tables_data_sync_enabled', 'yes' );
-```
+1. **Features page UI**: WooCommerce, Settings, Advanced, Features. Tick "Enable compatibility mode (Synchronize products between High-performance product storage and WordPress posts storage)" under the Product data storage radio. The checkbox is exposed as an `additional_settings` entry on the HPPS feature definition, mirroring the HPOS compatibility-mode toggle.
+2. **WP-CLI / option update**:
 
-or programmatically with the filter:
+   ```php
+   update_option( 'woocommerce_custom_product_tables_data_sync_enabled', 'yes' );
+   ```
 
-```php
-add_filter( 'woocommerce_hpps_data_sync_enabled', '__return_true' );
-```
+3. **Filter** (no persistence):
+
+   ```php
+   add_filter( 'woocommerce_hpps_data_sync_enabled', '__return_true' );
+   ```
 
 ### CPT → HPPS
 

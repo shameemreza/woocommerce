@@ -539,6 +539,9 @@ class CustomProductsTableController {
 			'order'                        => 51,
 			'setting'                      => $this->get_hpps_setting_for_feature(),
 			'default_plugin_compatibility' => FeaturePluginCompatibility::INCOMPATIBLE,
+			'additional_settings'          => array(
+				$this->get_hpps_setting_for_sync(),
+			),
 		);
 
 		$features_controller->add_feature_definition(
@@ -734,6 +737,79 @@ class CustomProductsTableController {
 			'desc'        => $get_desc,
 			'desc_at_end' => true,
 			'row_class'   => self::CUSTOM_PRODUCT_TABLES_USAGE_ENABLED_OPTION,
+		);
+	}
+
+	/**
+	 * Build the "Enable compatibility mode" checkbox displayed under the
+	 * HPPS radio on the Features page.
+	 *
+	 * Wraps {@see ProductDataSynchronizer::DATA_SYNC_ENABLED_OPTION},
+	 * which in turn drives {@see ProductDataSyncListener}: with the
+	 * checkbox on, postmeta writes mirror into the wc_products columns
+	 * and HPPS-side saves push values back into postmeta. Mirrors the
+	 * "compatibility mode" toggle HPOS exposes for orders so operators
+	 * coming from the orders side find the same lever in the same place.
+	 *
+	 * @return array Feature setting object compatible with FeaturesController.
+	 */
+	private function get_hpps_setting_for_sync(): array {
+		if ( 'yes' === get_transient( 'wc_installing' ) ) {
+			return array();
+		}
+
+		$get_value = function (): string {
+			return 'yes' === get_option( ProductDataSynchronizer::DATA_SYNC_ENABLED_OPTION, 'no' ) ? 'yes' : 'no';
+		};
+
+		$get_desc_tip = function (): string {
+			// Nothing useful to say while HPPS itself is off — the option
+			// persists but has no observable effect.
+			if ( ! $this->custom_product_tables_usage_is_enabled() ) {
+				return esc_html__( 'Has no effect while High-performance product storage is disabled.', 'woocommerce' );
+			}
+
+			// Migration still pending: surface it the same way the HPOS
+			// sync row does, with a "Sync now" link. Operators usually
+			// expect to flip compatibility mode on AFTER the back-fill
+			// finishes, but the option itself is safe either way.
+			if ( ! isset( $this->data_synchronizer ) ) {
+				return '';
+			}
+			if ( $this->data_synchronizer->has_products_pending_sync() ) {
+				$sync_now_url = wp_nonce_url(
+					add_query_arg( array( self::SYNC_QUERY_ARG => 'true' ), $this->features_controller->get_features_page_url() ),
+					'hpps-sync-now'
+				);
+
+				return wp_kses_post(
+					sprintf(
+						/* translators: %s: HTML link to "Sync products now". */
+						__( 'There are products still pending migration to the HPPS tables. %s', 'woocommerce' ),
+						sprintf(
+							'<a href="%1$s" class="button-link">%2$s</a>',
+							esc_url( $sync_now_url ),
+							esc_html__( 'Sync products now', 'woocommerce' )
+						)
+					)
+				);
+			}
+
+			if ( $this->data_synchronizer->data_sync_is_enabled() ) {
+				return esc_html__( 'Compatibility mode is on. Postmeta writes mirror into the HPPS tables, and HPPS saves mirror back into postmeta.', 'woocommerce' );
+			}
+
+			return esc_html__( 'Without compatibility mode, plugins that read or write product data via wp_postmeta directly may see stale values.', 'woocommerce' );
+		};
+
+		return array(
+			'id'        => ProductDataSynchronizer::DATA_SYNC_ENABLED_OPTION,
+			'title'     => '',
+			'type'      => 'checkbox',
+			'desc'      => __( 'Enable compatibility mode (Synchronize products between High-performance product storage and WordPress posts storage).', 'woocommerce' ),
+			'value'     => $get_value,
+			'desc_tip'  => $get_desc_tip,
+			'row_class' => ProductDataSynchronizer::DATA_SYNC_ENABLED_OPTION,
 		);
 	}
 }
