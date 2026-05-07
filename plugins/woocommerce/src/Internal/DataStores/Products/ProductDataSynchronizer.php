@@ -53,6 +53,14 @@ class ProductDataSynchronizer {
 	public const PRODUCTS_TABLE_CREATED_OPTION = 'woocommerce_custom_product_tables_created';
 
 	/**
+	 * When `'yes'`, the {@see ProductDataSyncListener} mirrors third-party
+	 * postmeta writes back into the matching `wc_products` columns. Mirrors
+	 * the role HPOS' `woocommerce_custom_orders_table_data_sync_enabled`
+	 * option plays for orders. Default `'no'` in Phase 1.
+	 */
+	public const DATA_SYNC_ENABLED_OPTION = 'woocommerce_custom_product_tables_data_sync_enabled';
+
+	/**
 	 * Source name used for synchronizer log entries.
 	 */
 	public const LOGS_SOURCE_NAME = 'product-data-synchronizer';
@@ -286,5 +294,65 @@ class ProductDataSynchronizer {
 	 */
 	public function migration_is_complete(): bool {
 		return 'done' === get_option( self::PRODUCTS_TABLE_MIGRATION_OPTION ) && ! $this->has_products_pending_sync();
+	}
+
+	/*
+	|--------------------------------------------------------------------------
+	| Data sync mode (CPT ↔ HPPS).
+	|--------------------------------------------------------------------------
+	*/
+
+	/**
+	 * Whether the CPT → HPPS sync listener should mirror third-party
+	 * postmeta writes into the `wc_products` columns.
+	 *
+	 * Driven by the {@see DATA_SYNC_ENABLED_OPTION} option, with a filter
+	 * for forcing the value at runtime (useful in tests or for integrations
+	 * that want to opt in without flipping the persistent option).
+	 *
+	 * @return bool
+	 */
+	public function data_sync_is_enabled(): bool {
+		$enabled = 'yes' === get_option( self::DATA_SYNC_ENABLED_OPTION, 'no' );
+
+		/**
+		 * Filter the effective value of the HPPS data-sync flag.
+		 *
+		 * Listeners should return `true` to enable real-time mirroring of
+		 * postmeta writes into the HPPS `wc_products` columns, or `false`
+		 * to suppress it.
+		 *
+		 * @since 10.9.0
+		 *
+		 * @param bool $enabled Whether sync is currently enabled.
+		 */
+		return (bool) apply_filters( 'woocommerce_hpps_data_sync_enabled', $enabled );
+	}
+
+	/**
+	 * Which side is currently authoritative for product reads when both
+	 * stores are kept in sync.
+	 *
+	 * In Phase 1 this is always `'hpps'` when the feature is on (since the
+	 * data store is unconditionally swapped). The method is exposed now so
+	 * that Phase 2's dual-mode cutover, plus any extension that wants to
+	 * temporarily route reads back through CPT, can depend on a stable
+	 * filter name.
+	 *
+	 * @return string Either `'hpps'` or `'cpt'`.
+	 */
+	public function authoritative_source(): string {
+		/**
+		 * Filter which storage layer is authoritative for product reads.
+		 *
+		 * Return `'hpps'` (the default when HPPS is enabled) or `'cpt'` to
+		 * force reads through the legacy CPT data store even while writes
+		 * continue to land on both sides via the sync listener.
+		 *
+		 * @since 10.9.0
+		 *
+		 * @param string $source Either `'hpps'` or `'cpt'`.
+		 */
+		return (string) apply_filters( 'woocommerce_hpps_authoritative_source', 'hpps' );
 	}
 }

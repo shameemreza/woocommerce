@@ -114,6 +114,13 @@ class CustomProductsTableController {
 	private ProductDataSynchronizer $data_synchronizer;
 
 	/**
+	 * Postmeta → wc_products column listener used in CPT ↔ HPPS sync mode.
+	 *
+	 * @var ProductDataSyncListener
+	 */
+	private ProductDataSyncListener $sync_listener;
+
+	/**
 	 * Constructor: register hooks. Dependencies are injected later via init().
 	 */
 	public function __construct() {
@@ -139,6 +146,7 @@ class CustomProductsTableController {
 	 * @param ProductsTableVariationDataStore $variation_data_store  Variation HPPS data store.
 	 * @param ProductsTableGroupedDataStore   $grouped_data_store    Grouped HPPS data store.
 	 * @param ProductDataSynchronizer         $data_synchronizer     Data synchronizer (table lifecycle + migration).
+	 * @param ProductDataSyncListener         $sync_listener         Postmeta → wc_products listener.
 	 */
 	final public function init(
 		FeaturesController $features_controller,
@@ -147,7 +155,8 @@ class CustomProductsTableController {
 		ProductsTableVariableDataStore $variable_data_store,
 		ProductsTableVariationDataStore $variation_data_store,
 		ProductsTableGroupedDataStore $grouped_data_store,
-		ProductDataSynchronizer $data_synchronizer
+		ProductDataSynchronizer $data_synchronizer,
+		ProductDataSyncListener $sync_listener
 	): void {
 		$this->features_controller  = $features_controller;
 		$this->plugin_util          = $plugin_util;
@@ -156,6 +165,11 @@ class CustomProductsTableController {
 		$this->variation_data_store = $variation_data_store;
 		$this->grouped_data_store   = $grouped_data_store;
 		$this->data_synchronizer    = $data_synchronizer;
+		$this->sync_listener        = $sync_listener;
+
+		// The listener gates itself on the data-sync option, so registering
+		// once is safe even when sync is off — it just no-ops on every hook.
+		$this->sync_listener->register_hooks();
 	}
 
 	/**
@@ -580,6 +594,13 @@ class CustomProductsTableController {
 		// race) we stay on the safe path.
 		$this->maybe_self_heal_tables();
 		if ( ! $this->data_synchronizer->get_table_exists() ) {
+			return $current_data_store;
+		}
+
+		// Authoritative-source filter: extensions can flip reads back to the
+		// legacy CPT store while HPPS continues to receive writes (Phase 2
+		// dual-mode cutover). The default value is `'hpps'`.
+		if ( 'hpps' !== $this->data_synchronizer->authoritative_source() ) {
 			return $current_data_store;
 		}
 

@@ -9,6 +9,8 @@
 - [WP-CLI reference](#wp-cli-reference)
 - [Hooks](#hooks)
 - [Rolling back](#rolling-back)
+- [Bidirectional sync (opt-in)](#bidirectional-sync-opt-in)
+- [Authoritative-source flag](#authoritative-source-flag)
 - [Phase 1 limitations](#phase-1-limitations)
 
 ## Summary
@@ -30,7 +32,7 @@ The feature is exposed under WooCommerce, Settings, Advanced, Features as Produc
 
 Programmatic toggle:
 
-```php
+```
 // Turn on (creates tables and enqueues the background migration if needed).
 update_option( 'woocommerce_custom_product_tables_enabled', 'yes' );
 
@@ -111,7 +113,7 @@ All commands live in `CLIRunner` and are registered under `wp wc hpps`.
 
 Prints pending count, migration option state, and whether the background processor is enqueued.
 
-```text
+```
 $ wp wc hpps status
 Pending products: 17
 Migration status: pending
@@ -165,6 +167,8 @@ Filters available specifically for HPPS callers:
 
 - `woocommerce_data_stores`: route a custom product type to your own data store, or replace HPPS' default.
 - `woocommerce_install_get_tables`: extend the table list HPPS keeps in lockstep with `dbDelta`.
+- `woocommerce_hpps_data_sync_enabled`: force the CPT → HPPS listener on or off without flipping the persistent option (see [Bidirectional sync](#bidirectional-sync-opt-in)).
+- `woocommerce_hpps_authoritative_source`: pick which storage layer is canonical for reads while the feature is on (see [Authoritative-source flag](#authoritative-source-flag)).
 
 ## Rolling back
 
@@ -176,11 +180,50 @@ To revert to legacy CPT storage:
 
 The HPPS tables are also included in `WC_Install::get_tables()`, so a full WC uninstall with `WC_REMOVE_ALL_DATA = true` cleans them up automatically. The placeholder posts are removed in the same uninstall path.
 
+## Bidirectional sync (opt-in)
+
+`ProductDataSyncListener` mirrors third-party `update_post_meta()` / `add_post_meta()` / `delete_post_meta()` writes on `product` and `product_variation` posts back into the matching columns on `wc_products`. It's a defence against extensions that bypass the WC API and write postmeta directly (a pricing plugin doing `update_post_meta( $product_id, '_price', '9.99' )`, an importer that pokes `_stock`).
+
+Enable it with:
+
+```php
+update_option( 'woocommerce_custom_product_tables_data_sync_enabled', 'yes' );
+```
+
+or programmatically with the filter:
+
+```php
+add_filter( 'woocommerce_hpps_data_sync_enabled', '__return_true' );
+```
+
+The listener is registered unconditionally but no-ops when sync is off, when the post isn't a product, when the meta key isn't in its mapping table, or when the product hasn't been migrated into HPPS yet. The mapping covers the common conversion paths (price, stock, sku, dimensions, virtual/downloadable flags, tax, ratings); composite columns (gallery, sale dates) and meta that needs richer parsing (cogs) still go through the data store layer.
+
+To bracket an HPPS-internal postmeta write so the listener doesn't echo it back, wrap the write in:
+
+```php
+ProductDataSyncListener::start_internal_write();
+try {
+    update_post_meta( $product_id, '_price', $value );
+} finally {
+    ProductDataSyncListener::end_internal_write();
+}
+```
+
+## Authoritative-source flag
+
+`ProductDataSynchronizer::authoritative_source()` returns `'hpps'` (default) or `'cpt'`. The data-store router consults it after the feature gate, so a site can flip the option on, run sync to keep both stores warm, and cut reads back to CPT temporarily by filtering:
+
+```php
+add_filter( 'woocommerce_hpps_authoritative_source', static fn() => 'cpt' );
+```
+
+This is the seam Phase 2 dual-mode cutover hangs off. In Phase 1 the default keeps HPPS authoritative whenever the feature is on, so existing behaviour doesn't change.
+
 ## Phase 1 limitations
 
 These are known and tracked. Don't ship them as bugs.
 
-- **One-way sync only.** Writes that originate from CPT (for example a third-party plugin doing `update_post_meta( $product_id, '_price', ... )`) are not reflected in `wc_products` until the next save through the WC API. Phase 2 will add bidirectional sync via post-meta and post-update listeners.
-- **No authoritative-source flag.** Phase 1 always treats HPPS as authoritative when the feature is on. Phase 2 will add a dual-mode cutover so operators can run with both stores live and pick which one is authoritative per request, enabling safer migrations on busy stores.
+- **Listener covers the high-impact meta keys, not every column.** Composite columns (`gallery_image_ids`, `date_on_sale_*`) and the COGS columns are not yet mirrored from postmeta; they update on the next full save through the WC API.
+- **No HPPS → CPT writeback yet.** When sync is on, postmeta drives `wc_products`, but the data store does not push column writes back into postmeta. Reads through the legacy CPT path still work because the placeholder + lookup-table sync keeps `wp_postmeta` populated for the columns the storefront and admin filter on.
 - **Taxonomies stay in WP.** `product_cat`, `product_tag`, `product_brand`, `product_shipping_class`, and `product_visibility` continue to live in `wp_term_relationships`. Moving them is out of scope for HPPS.
 - **Reports keep using the existing analytics tables.** HPPS feeds `wc_product_meta_lookup` so admin list filters work, but `wc_order_product_lookup` and the WC Analytics tables are unchanged.
