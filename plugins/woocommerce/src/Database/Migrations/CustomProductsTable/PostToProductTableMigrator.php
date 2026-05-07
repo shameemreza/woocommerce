@@ -392,14 +392,39 @@ class PostToProductTableMigrator {
 				'is_for_variation' => ! empty( $config['is_variation'] ) ? 1 : 0,
 			);
 
+			// A variation that was migrated before this parent may have
+			// already lazy-created the parent's row via
+			// {@see ensure_parent_attribute_id()}. Reuse it instead of
+			// inserting a duplicate (which would issue a fresh id and
+			// orphan the variation rows we just bound).
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-			$wpdb->insert(
-				ProductsTableDataStore::get_attributes_table_name(),
-				$attribute_data,
-				array( '%d', '%s', '%s', '%d', '%d', '%d' )
+			$attribute_row_id = (int) $wpdb->get_var(
+				$wpdb->prepare(
+					'SELECT id FROM %i WHERE product_id = %d AND name = %s LIMIT 1',
+					ProductsTableDataStore::get_attributes_table_name(),
+					$product_id,
+					$name
+				)
 			);
 
-			$attribute_row_id = (int) $wpdb->insert_id;
+			if ( $attribute_row_id > 0 ) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->update(
+					ProductsTableDataStore::get_attributes_table_name(),
+					$attribute_data,
+					array( 'id' => $attribute_row_id ),
+					array( '%d', '%s', '%s', '%d', '%d', '%d' ),
+					array( '%d' )
+				);
+			} else {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+				$wpdb->insert(
+					ProductsTableDataStore::get_attributes_table_name(),
+					$attribute_data,
+					array( '%d', '%s', '%s', '%d', '%d', '%d' )
+				);
+				$attribute_row_id = (int) $wpdb->insert_id;
+			}
 
 			$values_position = 0;
 			if ( ! empty( $config['is_taxonomy'] ) ) {
@@ -465,8 +490,6 @@ class PostToProductTableMigrator {
 	 * @return void
 	 */
 	private function insert_variation_attributes( int $variation_id, array $postmeta ): void {
-		global $wpdb;
-
 		$parent_id = (int) wp_get_post_parent_id( $variation_id );
 
 		$position = 0;
@@ -480,16 +503,7 @@ class PostToProductTableMigrator {
 			$term_id        = null;
 
 			if ( $parent_id > 0 ) {
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-				$attribute_id = (int) $wpdb->get_var(
-					$wpdb->prepare(
-						'SELECT id FROM %i WHERE product_id = %d AND ( name = %s OR taxonomy = %s ) LIMIT 1',
-						ProductsTableDataStore::get_attributes_table_name(),
-						$parent_id,
-						$attribute_name,
-						$attribute_name
-					)
-				);
+				$attribute_id = $this->ensure_parent_attribute_id( $parent_id, $attribute_name );
 			}
 
 			if ( taxonomy_exists( $attribute_name ) && '' !== (string) $value ) {
@@ -511,6 +525,89 @@ class PostToProductTableMigrator {
 			);
 			++$position;
 		}
+	}
+
+	/**
+	 * Resolve `wc_product_attributes.id` for a (parent_id, attribute_name)
+	 * pair, lazily creating the parent attribute row from postmeta when
+	 * the parent hasn't been migrated yet.
+	 *
+	 * The migrator processes posts in whatever order the batch arrives in,
+	 * which means a variation may be migrated before its parent (e.g. on a
+	 * re-run after a partial failure, or when a single product is migrated
+	 * via the WP-CLI command). Without lazy creation, the variation's
+	 * `wc_product_attribute_values` row would store `attribute_id = 0` and
+	 * silently dangle until the parent's eventual migration — and even then
+	 * the dangling row wouldn't get fixed up because the parent's insert
+	 * doesn't reach into variation rows.
+	 *
+	 * Returns 0 when the parent has no `_product_attributes` entry that
+	 * matches `$attribute_name`, in which case the variation row is
+	 * intentionally orphaned (matches the legacy CPT behaviour where a
+	 * variation with no matching parent attribute is left dangling until
+	 * re-saved through the WC API).
+	 *
+	 * @param int    $parent_id      Variable parent product id.
+	 * @param string $attribute_name Attribute name (sanitised slug).
+	 * @return int Resolved or freshly-created attribute id, or 0 if none.
+	 */
+	private function ensure_parent_attribute_id( int $parent_id, string $attribute_name ): int {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$existing = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				'SELECT id FROM %i WHERE product_id = %d AND ( name = %s OR taxonomy = %s ) LIMIT 1',
+				ProductsTableDataStore::get_attributes_table_name(),
+				$parent_id,
+				$attribute_name,
+				$attribute_name
+			)
+		);
+		if ( $existing > 0 ) {
+			return $existing;
+		}
+
+		// Parent's row hasn't been migrated yet, or hasn't had its
+		// attributes inserted yet. Try to synthesise the row from the
+		// parent's `_product_attributes` postmeta so the variation can
+		// bind to it and the eventual parent migration can be a no-op.
+		$raw = get_post_meta( $parent_id, '_product_attributes', true );
+		$raw = is_string( $raw ) ? maybe_unserialize( $raw ) : $raw;
+		if ( ! is_array( $raw ) || empty( $raw ) ) {
+			return 0;
+		}
+
+		$matching_config = null;
+		foreach ( $raw as $attribute_key => $config ) {
+			$config = (array) $config;
+			$name   = (string) ( $config['name'] ?? $attribute_key );
+			if ( $name === $attribute_name ) {
+				$matching_config = $config;
+				break;
+			}
+		}
+		if ( null === $matching_config ) {
+			return 0;
+		}
+
+		$attribute_data = array(
+			'product_id'       => $parent_id,
+			'name'             => $attribute_name,
+			'taxonomy'         => ! empty( $matching_config['is_taxonomy'] ) ? $attribute_name : '',
+			'position'         => isset( $matching_config['position'] ) ? (int) $matching_config['position'] : 0,
+			'is_visible'       => ! empty( $matching_config['is_visible'] ) ? 1 : 0,
+			'is_for_variation' => ! empty( $matching_config['is_variation'] ) ? 1 : 0,
+		);
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->insert(
+			ProductsTableDataStore::get_attributes_table_name(),
+			$attribute_data,
+			array( '%d', '%s', '%s', '%d', '%d', '%d' )
+		);
+
+		return (int) $wpdb->insert_id;
 	}
 
 	/**
