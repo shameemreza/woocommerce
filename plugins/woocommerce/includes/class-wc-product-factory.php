@@ -133,7 +133,13 @@ class WC_Product_Factory {
 	private function get_product_id( $product ) {
 		global $post;
 
-		if ( false === $product && isset( $post, $post->ID ) && 'product' === get_post_type( $post->ID ) ) {
+		// `product_placeholder` is the non-public CPT HPPS allocates for
+		// programmatically-created products (so the legacy CPT save hooks
+		// don't fire). The post still resolves to a real product; treat it
+		// the same as `product` here so `wc_get_product()` (with no args,
+		// relying on the global $post) doesn't return false in admin
+		// templates that happen to be rendering an HPPS-native product.
+		if ( false === $product && isset( $post, $post->ID ) && in_array( get_post_type( $post->ID ), array( 'product', 'product_placeholder' ), true ) ) {
 			return absint( $post->ID );
 		} elseif ( is_numeric( $product ) ) {
 			return $product;
