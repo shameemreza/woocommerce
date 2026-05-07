@@ -208,33 +208,64 @@ class ProductsTableVariableDataStore extends ProductsTableDataStore implements W
 		global $wpdb;
 
 		$parent_id = (int) $product->get_id();
-		$search    = $previous_name ? $previous_name : 'AUTO-DRAFT';
-
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-		$wpdb->query(
-			$wpdb->prepare(
-				'UPDATE ' . self::get_products_table_name() . ' SET name = REPLACE( name, %s, %s ) WHERE parent_id = %d AND type = %s', // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-				$search,
-				$new_name,
-				$parent_id,
-				ProductType::VARIATION
-			)
-		);
-		$wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$wpdb->posts} SET post_title = REPLACE( post_title, %s, %s ) WHERE post_parent = %d AND post_type = %s",
-				$search,
-				$new_name,
-				$parent_id,
-				CustomProductsTableController::PLACEHOLDER_POST_TYPE
-			)
-		);
-		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
-
-		$invalidator = wc_get_container()->get( ProductVersionStringInvalidator::class );
-		foreach ( (array) $product->get_children() as $child_id ) {
-			$invalidator->invalidate( (int) $child_id );
+		if ( $parent_id <= 0 ) {
+			return;
 		}
+
+		// Hydrate each variation, recompute its title from scratch via the
+		// canonical generator (parent name + attribute summary), and write
+		// the new title to both `wc_products.name` and the placeholder
+		// `wp_posts.post_title`. The previous SQL `REPLACE()` approach
+		// did substring substitution, so any variation whose custom name
+		// happened to embed the old parent name (e.g. "Premium Toolkit
+		// Limited Run") got its title corrupted on every parent rename,
+		// and variations with custom names that didn't include the old
+		// parent name didn't get updated at all.
+		$variation_data_store = wc_get_container()->get( ProductsTableVariationDataStore::class );
+
+		$post_types  = array(
+			'product_variation',
+			CustomProductsTableController::PLACEHOLDER_POST_TYPE,
+		);
+		$invalidator = wc_get_container()->get( ProductVersionStringInvalidator::class );
+
+		foreach ( (array) $product->get_children() as $child_id ) {
+			$child_id = (int) $child_id;
+			if ( $child_id <= 0 ) {
+				continue;
+			}
+
+			$variation = wc_get_product( $child_id );
+			if ( ! $variation || ! is_a( $variation, 'WC_Product_Variation' ) ) {
+				continue;
+			}
+
+			$new_title = $variation_data_store->generate_product_title( $variation );
+
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$wpdb->update(
+				self::get_products_table_name(),
+				array( 'name' => $new_title ),
+				array( 'id' => $child_id ),
+				array( '%s' ),
+				array( '%d' )
+			);
+
+			$wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$wpdb->posts} SET post_title = %s WHERE ID = %d AND post_type IN ( %s, %s )",
+					$new_title,
+					$child_id,
+					$post_types[0],
+					$post_types[1]
+				)
+			);
+			// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+
+			clean_post_cache( $child_id );
+			$invalidator->invalidate( $child_id );
+		}
+
 		$invalidator->invalidate( $parent_id );
 	}
 

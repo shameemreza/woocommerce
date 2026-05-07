@@ -492,7 +492,7 @@ class ProductsTableVariationDataStore extends ProductsTableDataStore implements 
 	 *                            it; runtime is always a variation).
 	 * @return string
 	 */
-	protected function generate_product_title( $product ): string {
+	public function generate_product_title( $product ): string {
 		$attributes = (array) $product->get_attributes();
 
 		$should_include_attributes = count( $attributes ) < 3;
