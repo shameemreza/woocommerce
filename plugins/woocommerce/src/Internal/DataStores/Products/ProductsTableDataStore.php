@@ -747,6 +747,7 @@ CREATE TABLE {$meta_table} (
 		$product->apply_changes();
 
 		$this->update_lookup_table( $product->get_id() );
+		$this->clear_caches( $product );
 
 		/**
 		 * Fires when a new product is created via HPPS.
@@ -916,6 +917,7 @@ CREATE TABLE {$meta_table} (
 		$product->apply_changes();
 
 		$this->update_lookup_table( $product->get_id() );
+		$this->clear_caches( $product );
 
 		$new_status = $product->get_status();
 		if ( $previous_status && $previous_status !== $new_status ) {
@@ -1008,6 +1010,11 @@ CREATE TABLE {$meta_table} (
 				throw $e;
 			}
 
+			// `wc_delete_product_transients()` and the cache-helper invalidations
+			// have to happen *before* `set_id( 0 )` since the helper reads the
+			// id off the product object.
+			$this->clear_caches( $product );
+
 			$product->set_id( 0 );
 
 			/**
@@ -1044,6 +1051,7 @@ CREATE TABLE {$meta_table} (
 		// and leaks rows when a product is trashed-and-recreated rather than
 		// untrashed.
 		$this->delete_from_lookup_table( $product_id, 'wc_product_meta_lookup' );
+		$this->clear_caches( $product );
 
 		/**
 		 * Fires when a product is trashed under HPPS.
@@ -3048,7 +3056,14 @@ CREATE TABLE {$meta_table} (
 			array( '%d' )
 		);
 
-		update_post_meta( $product_id, '_wc_average_rating', $rating );
+		// Bracket the postmeta write so the bidirectional listener doesn't
+		// echo us back into wc_products and double-bust caches.
+		ProductDataSyncListener::start_internal_write();
+		try {
+			update_post_meta( $product_id, '_wc_average_rating', $rating );
+		} finally {
+			ProductDataSyncListener::end_internal_write();
+		}
 		$this->update_lookup_table( $product_id );
 		$this->sync_visibility_terms( $product, true );
 	}
@@ -3077,7 +3092,12 @@ CREATE TABLE {$meta_table} (
 			array( '%d' )
 		);
 
-		update_post_meta( $product_id, '_wc_review_count', $count );
+		ProductDataSyncListener::start_internal_write();
+		try {
+			update_post_meta( $product_id, '_wc_review_count', $count );
+		} finally {
+			ProductDataSyncListener::end_internal_write();
+		}
 		$this->update_lookup_table( $product_id );
 	}
 
@@ -3114,8 +3134,56 @@ CREATE TABLE {$meta_table} (
 			array( '%d' )
 		);
 
-		update_post_meta( $product_id, '_wc_rating_count', $counts );
+		ProductDataSyncListener::start_internal_write();
+		try {
+			update_post_meta( $product_id, '_wc_rating_count', $counts );
+		} finally {
+			ProductDataSyncListener::end_internal_write();
+		}
 		$this->update_lookup_table( $product_id );
+	}
+
+	/**
+	 * Invalidate the WC caches that depend on a given product after a
+	 * `create()` / `update()` / `delete()`.
+	 *
+	 * Mirrors {@see WC_Product_Data_Store_CPT::clear_caches()} so callers
+	 * that previously relied on the legacy data store's transient/object
+	 * cache invalidation (on-sale lists, featured products, related
+	 * products, attribute counts, the product instance cache) keep working
+	 * once HPPS owns the write path.
+	 *
+	 * @param \WC_Product $product Product object.
+	 * @return void
+	 */
+	protected function clear_caches( &$product ): void {
+		if ( ! $product instanceof \WC_Product ) {
+			return;
+		}
+
+		$product_id = (int) $product->get_id();
+		if ( $product_id <= 0 ) {
+			return;
+		}
+
+		\wc_delete_product_transients( $product_id );
+
+		$parent_id = (int) $product->get_parent_id( 'edit' );
+		if ( $parent_id > 0 ) {
+			\wc_delete_product_transients( $parent_id );
+			\WC_Cache_Helper::invalidate_cache_group( 'product_' . $parent_id );
+		}
+
+		\WC_Cache_Helper::invalidate_attribute_count( array_keys( (array) $product->get_attributes() ) );
+		\WC_Cache_Helper::invalidate_cache_group( 'product_' . $product_id );
+
+		// Drop the product instance cache last so anything called above that
+		// re-hydrates the product (transient deletion can fire hooks that
+		// re-read it) doesn't leave a stale object behind.
+		if ( \Automattic\WooCommerce\Utilities\FeaturesUtil::feature_is_enabled( 'product_instance_caching' ) ) {
+			$cache = wc_get_container()->get( \Automattic\WooCommerce\Internal\Caches\ProductCache::class );
+			$cache->remove( $product_id );
+		}
 	}
 
 }
